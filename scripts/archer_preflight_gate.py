@@ -109,6 +109,25 @@ def actual_mode_from(metrics: dict[str, Any]) -> Any:
     return run.get("mode") or metrics.get("mode") or os.environ.get("ARCHER_RUN_MODE")
 
 
+def source_expectations(args: argparse.Namespace) -> tuple[str, str]:
+    expected_checksum = getattr(args, "expected_source_checksum", "") or os.environ.get(
+        "ARCHER_EXPECTED_SOURCE_CHECKSUM", ""
+    )
+    expected_commit = getattr(args, "expected_source_commit", "") or os.environ.get(
+        "ARCHER_EXPECTED_SOURCE_COMMIT", ""
+    )
+    return expected_commit, expected_checksum
+
+
+def source_required_for(args: argparse.Namespace) -> bool:
+    if bool(getattr(args, "allow_missing_source", False)):
+        return False
+    expected_mode = expected_mode_from(args)
+    return expected_mode in {"shadow", "canary"} and (
+        bool(getattr(args, "static_only", False)) or bool(getattr(args, "post_start", False))
+    )
+
+
 def normalize_path_text(path: Any) -> str:
     if path is None:
         return ""
@@ -120,6 +139,14 @@ def validate_local_artifacts(metrics: dict[str, Any], args: argparse.Namespace) 
     config: dict[str, dict[str, Any]] = {}
 
     expected_mode = expected_mode_from(args)
+    if bool(getattr(args, "static_only", False)) and source_required_for(args):
+        expected_commit, expected_checksum = source_expectations(args)
+        if not expected_commit or not expected_checksum:
+            failures.append(
+                "source commit/checksum inputs are required before Archer "
+                f"{expected_mode} start"
+            )
+
     if expected_mode and not bool(getattr(args, "static_only", False)):
         actual_mode = actual_mode_from(metrics)
         if actual_mode != expected_mode:
@@ -175,6 +202,8 @@ def validate_local_artifacts(metrics: dict[str, Any], args: argparse.Namespace) 
                         rollback_command,
                         config,
                         include_metrics=not bool(getattr(args, "static_only", False)),
+                        require_wallet_readiness_fields=expected_mode == "canary"
+                        and bool(getattr(args, "post_start", False)),
                     )
                 )
 
@@ -187,6 +216,7 @@ def validate_canary_envelope(
     rollback_command: str,
     config: Optional[dict[str, dict[str, Any]]] = None,
     include_metrics: bool = True,
+    require_wallet_readiness_fields: bool = False,
 ) -> list[str]:
     failures: list[str] = []
     config = config or {}
@@ -243,7 +273,13 @@ def validate_canary_envelope(
             )
 
         failures.extend(validate_wallet_limits(envelope, metrics))
-        failures.extend(validate_wallet_readiness(metrics, config))
+        failures.extend(
+            validate_wallet_readiness(
+                metrics,
+                config,
+                require_fields=require_wallet_readiness_fields,
+            )
+        )
 
     return failures
 
@@ -355,24 +391,39 @@ def validate_wallet_limits(envelope: dict[str, dict[str, Any]], metrics: dict[st
 
 
 def validate_wallet_readiness(
-    metrics: dict[str, Any], config: Optional[dict[str, dict[str, Any]]] = None
+    metrics: dict[str, Any],
+    config: Optional[dict[str, dict[str, Any]]] = None,
+    require_fields: bool = False,
 ) -> list[str]:
     wallet = metrics.get("wallet", {})
     if not isinstance(wallet, dict):
+        if require_fields:
+            return ["wallet readiness metrics are missing"]
         return []
     failures: list[str] = []
     config = config or {}
 
     expected_keypair = config.get("market", {}).get("maker_keypair_path")
     actual_keypair = wallet.get("keypair_path") or wallet.get("maker_keypair_path")
-    if expected_keypair and actual_keypair:
+    if expected_keypair and not actual_keypair and require_fields:
+        failures.append("wallet keypair readiness is missing")
+    elif expected_keypair and actual_keypair:
         if normalize_path_text(actual_keypair) != normalize_path_text(expected_keypair):
             failures.append(
                 f"wallet keypair {actual_keypair} != config maker_keypair_path {expected_keypair}"
             )
 
     token_accounts = wallet.get("token_accounts") or wallet.get("token_account_readiness") or {}
+    if require_fields and not isinstance(token_accounts, dict) or (
+        require_fields and isinstance(token_accounts, dict) and not token_accounts
+    ):
+        failures.append("token account readiness is missing")
+        return failures
     if isinstance(token_accounts, dict):
+        if require_fields:
+            for required_label in ("wsol", "usdc"):
+                if required_label not in token_accounts:
+                    failures.append(f"token account readiness is missing for {required_label}")
         for label, state in token_accounts.items():
             if isinstance(state, bool):
                 ready = state
@@ -435,8 +486,15 @@ def validate_metrics(metrics: dict[str, Any], args: argparse.Namespace) -> list[
             config = {}
 
     failures.extend(validate_source(metrics, args))
-    failures.extend(validate_wallet_readiness(metrics, config))
-    failures.extend(validate_supervisor(metrics))
+    failures.extend(
+        validate_wallet_readiness(
+            metrics,
+            config,
+            require_fields=expected_mode_from(args) == "canary"
+            and bool(getattr(args, "post_start", False)),
+        )
+    )
+    failures.extend(validate_supervisor(metrics, args))
 
     run = metrics.get("run", {})
     if args.expected_run_id and run.get("run_id") != args.expected_run_id:
@@ -538,12 +596,14 @@ def validate_metrics(metrics: dict[str, Any], args: argparse.Namespace) -> list[
 def validate_source(metrics: dict[str, Any], args: argparse.Namespace) -> list[str]:
     failures: list[str] = []
     source = metrics.get("source") or metrics.get("build") or {}
-    expected_checksum = getattr(args, "expected_source_checksum", "") or os.environ.get(
-        "ARCHER_EXPECTED_SOURCE_CHECKSUM", ""
-    )
-    expected_commit = getattr(args, "expected_source_commit", "") or os.environ.get(
-        "ARCHER_EXPECTED_SOURCE_COMMIT", ""
-    )
+    expected_commit, expected_checksum = source_expectations(args)
+    if source_required_for(args) and (not expected_commit or not expected_checksum):
+        failures.append("source commit/checksum inputs are required before post-start validation")
+    if source_required_for(args) and not source:
+        failures.append("source metrics are missing")
+        return failures
+    if source_required_for(args) and (not source.get("commit") or not source.get("checksum")):
+        failures.append("source metrics are missing commit/checksum")
     if expected_checksum and source.get("checksum") != expected_checksum:
         failures.append(f"source checksum {source.get('checksum')} != expected {expected_checksum}")
     if expected_commit and source.get("commit") != expected_commit:
@@ -551,19 +611,40 @@ def validate_source(metrics: dict[str, Any], args: argparse.Namespace) -> list[s
     return failures
 
 
-def validate_supervisor(metrics: dict[str, Any]) -> list[str]:
+def validate_supervisor(metrics: dict[str, Any], args: argparse.Namespace) -> list[str]:
     supervisor = metrics.get("supervisor", {})
     if not isinstance(supervisor, dict):
+        if bool(getattr(args, "post_start", False)) and expected_mode_from(args) in {
+            "shadow",
+            "canary",
+        }:
+            return ["supervisor metrics are missing"]
         return []
     failures: list[str] = []
+    if bool(getattr(args, "post_start", False)) and expected_mode_from(args) in {
+        "shadow",
+        "canary",
+    } and not supervisor:
+        failures.append("supervisor metrics are missing")
+        return failures
     if "expected_active" in supervisor:
         expected_active = bool(supervisor.get("expected_active"))
         active = supervisor.get("active")
         if active is not expected_active:
             failures.append(f"supervisor active {active} != expected {expected_active}")
+    elif bool(getattr(args, "post_start", False)) and expected_mode_from(args) in {
+        "shadow",
+        "canary",
+    }:
+        failures.append("supervisor active metrics are missing")
 
     policy = supervisor.get("policy", {})
     if isinstance(policy, dict):
+        if bool(getattr(args, "post_start", False)) and expected_mode_from(args) in {
+            "shadow",
+            "canary",
+        } and not policy:
+            failures.append("supervisor policy metrics are missing")
         if policy.get("ok") is False:
             failures.append(f"supervisor policy is not ok: {policy.get('status')}")
     elif supervisor.get("policy_ok") is False:
@@ -613,6 +694,7 @@ def main() -> None:
     parser.add_argument("--allow-market-owner-mismatch", action="store_true")
     parser.add_argument("--allow-missing-market-intel", action="store_true")
     parser.add_argument("--require-canary-envelope", action="store_true")
+    parser.add_argument("--allow-missing-source", action="store_true")
     args = parser.parse_args()
     args.require_no_bot = not args.allow_running_bot
     args.require_no_controller = not args.allow_running_controller

@@ -21,14 +21,33 @@ def load_ops_module():
     return module
 
 
+def source_env() -> dict[str, str]:
+    return {
+        "ARCHER_EXPECTED_SOURCE_COMMIT": "deadbeef",
+        "ARCHER_EXPECTED_SOURCE_CHECKSUM": "sha256:abc123",
+    }
+
+
 class ArcherOpsCommandTests(unittest.TestCase):
+    def test_shadow_start_requires_source_identity(self) -> None:
+        ops = load_ops_module()
+
+        with self.assertRaisesRegex(ValueError, "ARCHER_EXPECTED_SOURCE"):
+            ops.build_plan(
+                "shadow-start",
+                run_id="test-shadow",
+                env={},
+                execute=False,
+                confirm_live_canary=False,
+            )
+
     def test_shadow_start_plan_is_dry_run_and_never_sets_live_gate(self) -> None:
         ops = load_ops_module()
 
         plan = ops.build_plan(
             "shadow-start",
             run_id="test-shadow",
-            env={},
+            env=source_env(),
             execute=False,
             confirm_live_canary=False,
         )
@@ -44,7 +63,7 @@ class ArcherOpsCommandTests(unittest.TestCase):
         plan = ops.build_plan(
             "shadow-start",
             run_id="test-shadow",
-            env={},
+            env=source_env(),
             execute=False,
             confirm_live_canary=False,
         )
@@ -54,6 +73,26 @@ class ArcherOpsCommandTests(unittest.TestCase):
         self.assertIn("docker compose", flattened[1])
         self.assertIn("--post-start", flattened[2])
         self.assertTrue(plan["dry_run"])
+
+    def test_shadow_start_passes_profile_and_source_to_preflight(self) -> None:
+        ops = load_ops_module()
+
+        plan = ops.build_plan(
+            "shadow-start",
+            run_id="test-shadow",
+            env=source_env(),
+            execute=False,
+            confirm_live_canary=False,
+        )
+
+        flattened = [" ".join(command) for command in plan["commands"]]
+        for command in (flattened[0], flattened[2]):
+            self.assertIn("--expected-profile overnight_balanced_low_churn", command)
+            self.assertIn("--expected-source-commit deadbeef", command)
+            self.assertIn("--expected-source-checksum sha256:abc123", command)
+        self.assertIn("ARCHER_EXPECTED_PROFILE=overnight_balanced_low_churn", flattened[1])
+        self.assertIn("ARCHER_SOURCE_COMMIT=deadbeef", flattened[1])
+        self.assertIn("ARCHER_SOURCE_CHECKSUM=sha256:abc123", flattened[1])
 
     def test_canary_start_requires_live_gate_profile_and_approval(self) -> None:
         ops = load_ops_module()
@@ -74,6 +113,7 @@ class ArcherOpsCommandTests(unittest.TestCase):
             "canary-start",
             run_id="test-canary",
             env={
+                **source_env(),
                 "ARCHER_ENABLE_LIVE_TRADING": "true",
                 "ARCHER_CANARY_PROFILE": "first-live-sol-usdc",
                 "ARCHER_CANARY_APPROVAL_ID": "approval-123",
@@ -88,6 +128,12 @@ class ArcherOpsCommandTests(unittest.TestCase):
         self.assertIn("docker compose", flattened[1])
         self.assertIn("--post-start", flattened[2])
         self.assertIn("--require-canary-envelope", flattened[2])
+        self.assertIn("--expected-profile first-live-sol-usdc", flattened[2])
+        self.assertIn("--expected-source-commit deadbeef", flattened[2])
+        self.assertIn("--expected-source-checksum sha256:abc123", flattened[2])
+        self.assertIn("ARCHER_EXPECTED_PROFILE=first-live-sol-usdc", flattened[1])
+        self.assertIn("ARCHER_SOURCE_COMMIT=deadbeef", flattened[1])
+        self.assertIn("ARCHER_SOURCE_CHECKSUM=sha256:abc123", flattened[1])
         self.assertTrue(plan["dry_run"])
 
         with self.assertRaisesRegex(ValueError, "ARCHER_CANARY_APPROVAL_ID"):
@@ -95,6 +141,7 @@ class ArcherOpsCommandTests(unittest.TestCase):
                 "canary-start",
                 run_id="test-canary",
                 env={
+                    **source_env(),
                     "ARCHER_ENABLE_LIVE_TRADING": "true",
                     "ARCHER_CANARY_PROFILE": "first-live-sol-usdc",
                 },

@@ -45,6 +45,7 @@ def args(**overrides: object) -> argparse.Namespace:
         "post_start": False,
         "expected_source_checksum": "",
         "expected_source_commit": "",
+        "allow_missing_source": False,
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -161,6 +162,8 @@ class ArcherPreflightGateTests(unittest.TestCase):
                     static_only=True,
                     expected_mode="shadow",
                     config_file=config_path,
+                    expected_source_checksum="sha256:abc123",
+                    expected_source_commit="deadbeef",
                     expected_run_id="",
                     expected_profile="",
                     require_market_intel=False,
@@ -237,6 +240,8 @@ command = "{rollback_path}"
                     static_only=True,
                     expected_mode="canary",
                     config_file=config_path,
+                    expected_source_checksum="sha256:abc123",
+                    expected_source_commit="deadbeef",
                     canary_envelope_file=envelope_path,
                     rollback_command=rollback_path,
                     require_canary_envelope=True,
@@ -246,6 +251,41 @@ command = "{rollback_path}"
             )
 
         self.assertEqual(failures, [])
+
+    def test_static_only_requires_source_identity_or_override(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = os.path.join(tmp, "archer-shadow.toml")
+            with open(config_path, "w", encoding="utf-8") as fh:
+                fh.write("[execution]\nshadow_mode = true\n")
+
+            failures = validate_metrics(
+                {},
+                args(
+                    static_only=True,
+                    expected_mode="shadow",
+                    config_file=config_path,
+                    expected_run_id="",
+                    expected_profile="",
+                    require_market_intel=False,
+                    require_owner_match=False,
+                ),
+            )
+            override_failures = validate_metrics(
+                {},
+                args(
+                    static_only=True,
+                    expected_mode="shadow",
+                    config_file=config_path,
+                    expected_run_id="",
+                    expected_profile="",
+                    require_market_intel=False,
+                    require_owner_match=False,
+                    allow_missing_source=True,
+                ),
+            )
+
+        self.assertTrue(any("source commit/checksum" in failure for failure in failures))
+        self.assertEqual(override_failures, [])
 
     def test_canary_envelope_rejects_oversized_wallet_and_token_errors(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -428,6 +468,218 @@ shadow_mode = true
         self.assertTrue(any("token account usdc" in failure for failure in failures))
         self.assertTrue(any("supervisor active" in failure for failure in failures))
         self.assertTrue(any("supervisor policy" in failure for failure in failures))
+
+    def test_post_start_shadow_requires_source_and_supervisor_blocks(self) -> None:
+        metrics = healthy_metrics()
+
+        failures = validate_metrics(
+            metrics,
+            args(
+                post_start=True,
+                expected_mode="shadow",
+                expected_source_checksum="sha256:abc123",
+                expected_source_commit="deadbeef",
+            ),
+        )
+
+        self.assertTrue(any("source metrics are missing" in failure for failure in failures))
+        self.assertTrue(any("supervisor metrics are missing" in failure for failure in failures))
+
+    def test_canary_requires_wallet_readiness_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = os.path.join(tmp, "archer-canary.toml")
+            envelope_path = os.path.join(tmp, "envelope.toml")
+            rollback_path = os.path.join(tmp, "rollback")
+            with open(rollback_path, "w", encoding="utf-8") as fh:
+                fh.write("#!/usr/bin/env sh\nexit 0\n")
+            os.chmod(rollback_path, 0o755)
+            with open(config_path, "w", encoding="utf-8") as fh:
+                fh.write(
+                    """
+[market]
+market_pubkey = "market-1"
+maker_keypair_path = "/tmp/archer.json"
+
+[strategy]
+spread_levels_bps = [80.0]
+
+[risk]
+max_quote_notional_per_level = 10.0
+max_total_quote_notional = 20.0
+min_base_reserve_pct = 75.0
+min_quote_reserve_pct = 75.0
+
+[execution]
+shadow_mode = false
+max_tx_per_minute = 2
+max_update_tx_per_10min = 2
+"""
+                )
+            with open(envelope_path, "w", encoding="utf-8") as fh:
+                fh.write(
+                    f"""
+[canary_envelope]
+approved_profile = "first-live-sol-usdc"
+market = "SOL/USDC"
+market_pubkey = "market-1"
+max_levels_per_side = 1
+max_quote_notional_per_level = 10.0
+max_total_quote_notional = 20.0
+max_wallet_base = 0.30
+max_wallet_quote = 50.0
+min_base_reserve_pct = 75.0
+min_quote_reserve_pct = 75.0
+max_tx_per_minute = 2
+max_update_tx_per_10min = 2
+max_runtime_minutes = 30
+
+[manifest_coexistence]
+same_market_rule = "manifest_same_market_must_be_stopped"
+
+[wallet_limits]
+max_native_sol_fee_reserve = 0.05
+max_wsol = 0.30
+max_usdc = 50.0
+
+[rollback]
+command = "{rollback_path}"
+"""
+                )
+
+            metrics = healthy_metrics()
+            metrics["run"]["mode"] = "canary"
+            metrics["strategy"]["active_profile"] = "first-live-sol-usdc"
+            metrics["strategy"]["min_effective_spread_bps"] = 80.0
+            metrics["strategy"]["effective_spreads_bps"] = [80.0]
+            metrics["status"]["base_free"] = 0.1
+            metrics["status"]["quote_free"] = 12.0
+            metrics["source"] = {"checksum": "sha256:abc123", "commit": "deadbeef"}
+            metrics["supervisor"] = {"expected_active": True, "active": True, "policy": {"ok": True}}
+            metrics["wallet"] = {
+                "pubkey": "maker",
+                "balances": {"native_sol": 0.01, "wsol": 0.1, "usdc": 12.0, "errors": []},
+            }
+
+            failures = validate_metrics(
+                metrics,
+                args(
+                    post_start=True,
+                    expected_mode="canary",
+                    expected_profile="first-live-sol-usdc",
+                    expected_source_checksum="sha256:abc123",
+                    expected_source_commit="deadbeef",
+                    config_file=config_path,
+                    canary_envelope_file=envelope_path,
+                    rollback_command=rollback_path,
+                    require_canary_envelope=True,
+                    min_base_free=0.0,
+                    min_quote_free=0.0,
+                    min_base_notional=0.0,
+                ),
+            )
+
+        self.assertTrue(any("wallet keypair readiness is missing" in failure for failure in failures))
+        self.assertTrue(any("token account readiness is missing" in failure for failure in failures))
+
+    def test_canary_accepts_matching_wallet_readiness(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = os.path.join(tmp, "archer-canary.toml")
+            envelope_path = os.path.join(tmp, "envelope.toml")
+            rollback_path = os.path.join(tmp, "rollback")
+            with open(rollback_path, "w", encoding="utf-8") as fh:
+                fh.write("#!/usr/bin/env sh\nexit 0\n")
+            os.chmod(rollback_path, 0o755)
+            with open(config_path, "w", encoding="utf-8") as fh:
+                fh.write(
+                    """
+[market]
+market_pubkey = "market-1"
+maker_keypair_path = "/tmp/archer.json"
+
+[strategy]
+spread_levels_bps = [80.0]
+
+[risk]
+max_quote_notional_per_level = 10.0
+max_total_quote_notional = 20.0
+min_base_reserve_pct = 75.0
+min_quote_reserve_pct = 75.0
+
+[execution]
+shadow_mode = false
+max_tx_per_minute = 2
+max_update_tx_per_10min = 2
+"""
+                )
+            with open(envelope_path, "w", encoding="utf-8") as fh:
+                fh.write(
+                    f"""
+[canary_envelope]
+approved_profile = "first-live-sol-usdc"
+market = "SOL/USDC"
+market_pubkey = "market-1"
+max_levels_per_side = 1
+max_quote_notional_per_level = 10.0
+max_total_quote_notional = 20.0
+max_wallet_base = 0.30
+max_wallet_quote = 50.0
+min_base_reserve_pct = 75.0
+min_quote_reserve_pct = 75.0
+max_tx_per_minute = 2
+max_update_tx_per_10min = 2
+max_runtime_minutes = 30
+
+[manifest_coexistence]
+same_market_rule = "manifest_same_market_must_be_stopped"
+
+[wallet_limits]
+max_native_sol_fee_reserve = 0.05
+max_wsol = 0.30
+max_usdc = 50.0
+
+[rollback]
+command = "{rollback_path}"
+"""
+                )
+
+            metrics = healthy_metrics()
+            metrics["run"]["mode"] = "canary"
+            metrics["strategy"]["active_profile"] = "first-live-sol-usdc"
+            metrics["strategy"]["min_effective_spread_bps"] = 80.0
+            metrics["strategy"]["effective_spreads_bps"] = [80.0]
+            metrics["status"]["base_free"] = 0.1
+            metrics["status"]["quote_free"] = 12.0
+            metrics["source"] = {"checksum": "sha256:abc123", "commit": "deadbeef"}
+            metrics["supervisor"] = {"expected_active": True, "active": True, "policy": {"ok": True}}
+            metrics["wallet"] = {
+                "pubkey": "maker",
+                "keypair_path": "/tmp/archer.json",
+                "balances": {"native_sol": 0.01, "wsol": 0.1, "usdc": 12.0, "errors": []},
+                "token_accounts": {
+                    "wsol": {"ready": True, "exists": True},
+                    "usdc": {"ready": True, "exists": True},
+                },
+            }
+
+            failures = validate_metrics(
+                metrics,
+                args(
+                    post_start=True,
+                    expected_mode="canary",
+                    expected_profile="first-live-sol-usdc",
+                    expected_source_checksum="sha256:abc123",
+                    expected_source_commit="deadbeef",
+                    config_file=config_path,
+                    canary_envelope_file=envelope_path,
+                    rollback_command=rollback_path,
+                    require_canary_envelope=True,
+                    min_base_free=0.0,
+                    min_quote_free=0.0,
+                    min_base_notional=0.0,
+                ),
+            )
+
+        self.assertEqual(failures, [])
 
     def test_invalid_metrics_file_fails_closed_without_traceback(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

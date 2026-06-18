@@ -531,6 +531,74 @@ class DashboardState:
                 balances["errors"].append(f"{label}: {exc}")
         return balances
 
+    def get_token_account_readiness(self) -> Dict[str, Any]:
+        readiness: Dict[str, Any] = {}
+        if not self.rpc_url or self.wallet_pubkey == "unknown":
+            return {
+                "wsol": {"ready": False, "exists": False, "error": "missing RPC URL or wallet pubkey"},
+                "usdc": {"ready": False, "exists": False, "error": "missing RPC URL or wallet pubkey"},
+            }
+        for label, mint in [("wsol", WSOL_MINT), ("usdc", USDC_MINT)]:
+            try:
+                result = self.rpc_call(
+                    "getTokenAccountsByOwner",
+                    [
+                        self.wallet_pubkey,
+                        {"mint": mint},
+                        {"encoding": "jsonParsed", "commitment": "confirmed"},
+                    ],
+                    timeout=DASHBOARD_RPC_TIMEOUT,
+                )
+                exists = bool(result.get("value", []))
+                readiness[label] = {"ready": exists, "exists": exists}
+            except Exception as exc:  # noqa: BLE001
+                readiness[label] = {"ready": False, "exists": False, "error": str(exc)}
+        return readiness
+
+    def expected_active_profile(self, strategy_ledger: Dict[str, Any]) -> Optional[str]:
+        if strategy_ledger.get("active"):
+            return strategy_ledger.get("active", {}).get("profile")
+        return (
+            os.environ.get("ARCHER_EXPECTED_PROFILE")
+            or os.environ.get("ARCHER_CANARY_PROFILE")
+            or os.environ.get("ARCHER_INITIAL_PROFILE")
+        )
+
+    def source_identity(self) -> Dict[str, Any]:
+        return {
+            "commit": os.environ.get("ARCHER_SOURCE_COMMIT")
+            or os.environ.get("ARCHER_EXPECTED_SOURCE_COMMIT")
+            or "",
+            "checksum": os.environ.get("ARCHER_SOURCE_CHECKSUM")
+            or os.environ.get("ARCHER_EXPECTED_SOURCE_CHECKSUM")
+            or "",
+        }
+
+    def supervisor_state(self, process: Dict[str, Any], source: Dict[str, Any]) -> Dict[str, Any]:
+        mode = os.environ.get("ARCHER_RUN_MODE") or "stopped"
+        expected_active = mode in {"shadow", "canary", "controller"}
+        if mode == "controller":
+            active = bool(process.get("controller_running"))
+        elif mode in {"shadow", "canary"}:
+            active = expected_active
+        else:
+            active = False
+        policy_ok = bool(source.get("commit") and source.get("checksum"))
+        if mode not in {"shadow", "canary"}:
+            policy_ok = True
+        return {
+            "mode": mode,
+            "expected_active": expected_active,
+            "active": active,
+            "process_active": bool(
+                process.get("controller_running") if mode == "controller" else process.get("bot_running")
+            ),
+            "policy": {
+                "ok": policy_ok,
+                "status": "ok" if policy_ok else "missing_source_identity",
+            },
+        }
+
     def get_market_intel(self) -> Dict[str, Any]:
         url = str(self.config.get("feed", {}).get("market_intel_signal_url") or "").strip()
         if not url:
@@ -903,9 +971,14 @@ class DashboardState:
                 "usdc": None,
                 "errors": ["skipped because live Archer RPC/status is unhealthy"],
             }
+            token_accounts = {
+                "wsol": {"ready": False, "exists": False, "error": "skipped because live Archer RPC/status is unhealthy"},
+                "usdc": {"ready": False, "exists": False, "error": "skipped because live Archer RPC/status is unhealthy"},
+            }
         else:
             transactions = self.get_transactions()
             balances = self.get_wallet_balances()
+            token_accounts = self.get_token_account_readiness()
         process = self.get_process_state()
         logs = self.get_logs()
         market_intel = self.get_market_intel()
@@ -918,6 +991,9 @@ class DashboardState:
         )
 
         strategy_ledger = self.get_strategy_ledger()
+        active_profile = self.expected_active_profile(strategy_ledger)
+        source = self.source_identity()
+        supervisor = self.supervisor_state(process, source)
         active_settings = (
             strategy_ledger.get("active", {}).get("settings")
             if strategy_ledger.get("active")
@@ -944,16 +1020,18 @@ class DashboardState:
             "pnl": self.compute_pnl(status, baseline, transactions, mid_price),
             "wallet": {
                 "pubkey": self.wallet_pubkey,
+                "keypair_path": self.wallet,
                 "balances": balances,
+                "token_accounts": token_accounts,
             },
+            "source": source,
+            "supervisor": supervisor,
             "transactions": transactions,
             "market_intel": market_intel,
             "process": process,
             "logs": logs,
             "strategy": {
-                "active_profile": strategy_ledger.get("active", {}).get("profile")
-                if strategy_ledger.get("active")
-                else None,
+                "active_profile": active_profile,
                 "active_reason": strategy_ledger.get("active", {}).get("reason")
                 if strategy_ledger.get("active")
                 else None,

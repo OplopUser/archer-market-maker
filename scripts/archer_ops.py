@@ -23,6 +23,8 @@ DEFAULT_SHADOW_CONFIG = "config/default.toml"
 DEFAULT_CANARY_CONFIG = "config/canary/archer-sol-usdc-first-live.toml"
 DEFAULT_ENVELOPE_FILE = "config/canary/archer-sol-usdc-first-live-envelope.toml"
 DEFAULT_ROLLBACK_COMMAND = "scripts/archer_ops.py rollback-stopped"
+DEFAULT_SHADOW_PROFILE = "overnight_balanced_low_churn"
+DEFAULT_CANARY_PROFILE = "first-live-sol-usdc"
 
 
 def rel(path: str) -> str:
@@ -38,6 +40,10 @@ def preflight_command(
     run_id: str,
     config_file: str,
     phase: str,
+    expected_profile: str,
+    source_commit: str = "",
+    source_checksum: str = "",
+    allow_missing_source: bool = False,
     envelope_file: str = "",
     rollback_command: str = "",
 ) -> list[str]:
@@ -50,6 +56,8 @@ def preflight_command(
         run_id,
         "--expected-mode",
         mode,
+        "--expected-profile",
+        expected_profile,
         "--config-file",
         rel(config_file),
     ]
@@ -63,6 +71,12 @@ def preflight_command(
         command.extend(["--rollback-command", rollback_command])
     if envelope_file:
         command.extend(["--canary-envelope-file", rel(envelope_file), "--require-canary-envelope"])
+    if source_commit:
+        command.extend(["--expected-source-commit", source_commit])
+    if source_checksum:
+        command.extend(["--expected-source-checksum", source_checksum])
+    if allow_missing_source:
+        command.append("--allow-missing-source")
     return command
 
 
@@ -83,6 +97,18 @@ def require_canary_gates(env: dict[str, str], confirm_live_canary: bool) -> None
         raise ValueError("canary-start requires ARCHER_CANARY_PROFILE=first-live-sol-usdc")
     if not env.get("ARCHER_CANARY_APPROVAL_ID"):
         raise ValueError("canary-start requires ARCHER_CANARY_APPROVAL_ID")
+
+
+def source_identity_from(env: dict[str, str]) -> tuple[str, str, bool]:
+    commit = env.get("ARCHER_EXPECTED_SOURCE_COMMIT", "") or env.get("ARCHER_SOURCE_COMMIT", "")
+    checksum = env.get("ARCHER_EXPECTED_SOURCE_CHECKSUM", "") or env.get("ARCHER_SOURCE_CHECKSUM", "")
+    allow_missing = env.get("ARCHER_ALLOW_MISSING_SOURCE", "").lower() == "true"
+    if not allow_missing and (not commit or not checksum):
+        raise ValueError(
+            "Archer start requires ARCHER_EXPECTED_SOURCE_COMMIT and "
+            "ARCHER_EXPECTED_SOURCE_CHECKSUM, or ARCHER_ALLOW_MISSING_SOURCE=true"
+        )
+    return commit, checksum, allow_missing
 
 
 def build_plan(
@@ -107,12 +133,17 @@ def build_plan(
 
     if action == "shadow-start":
         mode = "shadow"
+        source_commit, source_checksum, allow_missing_source = source_identity_from(env)
         commands.append(
             preflight_command(
                 mode="shadow",
                 run_id=run_id,
                 config_file=shadow_config,
                 phase="static",
+                expected_profile=DEFAULT_SHADOW_PROFILE,
+                source_commit=source_commit,
+                source_checksum=source_checksum,
+                allow_missing_source=allow_missing_source,
             )
         )
         commands.append(
@@ -128,6 +159,9 @@ def build_plan(
                 ),
                 ARCHER_RUN_ID=run_id,
                 ARCHER_RUN_MODE="shadow",
+                ARCHER_EXPECTED_PROFILE=DEFAULT_SHADOW_PROFILE,
+                ARCHER_SOURCE_COMMIT=source_commit,
+                ARCHER_SOURCE_CHECKSUM=source_checksum,
                 ARCHER_DASHBOARD_CONFIG=rel(shadow_config),
                 ARCHER_SHADOW_CONFIG=rel(shadow_config),
             )
@@ -138,6 +172,10 @@ def build_plan(
                 run_id=run_id,
                 config_file=shadow_config,
                 phase="post-start",
+                expected_profile=DEFAULT_SHADOW_PROFILE,
+                source_commit=source_commit,
+                source_checksum=source_checksum,
+                allow_missing_source=allow_missing_source,
             )
         )
         notes.append("Shadow start does not set ARCHER_ENABLE_LIVE_TRADING and runs --shadow.")
@@ -145,12 +183,17 @@ def build_plan(
         require_canary_gates(env, confirm_live_canary)
         mode = "canary"
         executes_live_transactions = execute
+        source_commit, source_checksum, allow_missing_source = source_identity_from(env)
         commands.append(
             preflight_command(
                 mode="canary",
                 run_id=run_id,
                 config_file=canary_config,
                 phase="static",
+                expected_profile=DEFAULT_CANARY_PROFILE,
+                source_commit=source_commit,
+                source_checksum=source_checksum,
+                allow_missing_source=allow_missing_source,
                 envelope_file=envelope_file,
                 rollback_command=rollback_command,
             )
@@ -168,6 +211,9 @@ def build_plan(
                 ),
                 ARCHER_RUN_ID=run_id,
                 ARCHER_RUN_MODE="canary",
+                ARCHER_EXPECTED_PROFILE=DEFAULT_CANARY_PROFILE,
+                ARCHER_SOURCE_COMMIT=source_commit,
+                ARCHER_SOURCE_CHECKSUM=source_checksum,
                 ARCHER_DASHBOARD_CONFIG=rel(canary_config),
                 ARCHER_CANARY_CONFIG=rel(canary_config),
                 ARCHER_CANARY_ENVELOPE=rel(envelope_file),
@@ -182,6 +228,10 @@ def build_plan(
                 run_id=run_id,
                 config_file=canary_config,
                 phase="post-start",
+                expected_profile=DEFAULT_CANARY_PROFILE,
+                source_commit=source_commit,
+                source_checksum=source_checksum,
+                allow_missing_source=allow_missing_source,
                 envelope_file=envelope_file,
                 rollback_command=rollback_command,
             )
