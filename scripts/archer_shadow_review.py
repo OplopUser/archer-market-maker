@@ -48,12 +48,150 @@ def _first_value(events: Iterable[Dict[str, Any]], key: str, default: Any = None
     return default
 
 
+def _average(values: Iterable[float]) -> Optional[float]:
+    values = [value for value in values if isinstance(value, (int, float))]
+    if not values:
+        return None
+    return sum(values) / len(values)
+
+
 def _status(has_failures: bool, has_warnings: bool) -> str:
     if has_failures:
         return "fail"
     if has_warnings:
         return "warn"
     return "pass"
+
+
+def _control_validation(events: List[Dict[str, Any]], key: str) -> Dict[str, Any]:
+    for event in events:
+        control = event.get(key)
+        if isinstance(control, dict):
+            return {
+                "status": str(control.get("status") or "warn"),
+                "details": control,
+            }
+    return {"status": "warn", "details": {}, "reason": "missing"}
+
+
+def _route_quality(events: List[Dict[str, Any]], policy: Dict[str, Any]) -> Dict[str, Any]:
+    scores = [
+        _as_float(event.get("route_quality", {}).get("score"), default=float("nan"))
+        for event in events
+        if isinstance(event.get("route_quality"), dict)
+    ]
+    scores = [score for score in scores if score == score]
+    min_score = min(scores) if scores else None
+    threshold = policy.get("min_route_quality_score")
+    if min_score is None:
+        status = "warn"
+    elif threshold is not None and min_score < _as_float(threshold):
+        status = "fail"
+    else:
+        status = "pass"
+    return {
+        "status": status,
+        "min_score": min_score,
+        "threshold": threshold,
+        "samples": len(scores),
+    }
+
+
+def _no_fill_exposure(events: List[Dict[str, Any]], policy: Dict[str, Any]) -> Dict[str, Any]:
+    quote_notionals: List[float] = []
+    for event in events:
+        exposure = event.get("no_fill_exposure")
+        if not isinstance(exposure, dict):
+            continue
+        quote_notionals.append(
+            _as_float(exposure.get("bid_notional")) + _as_float(exposure.get("ask_notional"))
+        )
+    max_quote_notional = max(quote_notionals) if quote_notionals else 0.0
+    threshold = policy.get("max_no_fill_quote_notional")
+    status = (
+        "fail"
+        if threshold is not None and max_quote_notional > _as_float(threshold)
+        else "pass"
+    )
+    return {
+        "status": status,
+        "max_quote_notional": max_quote_notional,
+        "threshold": threshold,
+        "samples": len(quote_notionals),
+    }
+
+
+def _expected_fill_edge(events: List[Dict[str, Any]], policy: Dict[str, Any]) -> Dict[str, Any]:
+    fill_probabilities = []
+    edge_bps = []
+    for event in events:
+        expected_fill = event.get("expected_fill")
+        expected_edge = event.get("expected_edge")
+        if isinstance(expected_fill, dict):
+            fill_probabilities.append(_as_float(expected_fill.get("probability"), default=float("nan")))
+        if isinstance(expected_edge, dict):
+            edge_bps.append(_as_float(expected_edge.get("bps"), default=float("nan")))
+    fill_probabilities = [value for value in fill_probabilities if value == value]
+    edge_bps = [value for value in edge_bps if value == value]
+    avg_edge = _average(edge_bps)
+    threshold = policy.get("min_expected_edge_bps")
+    status = (
+        "fail"
+        if avg_edge is not None and threshold is not None and avg_edge < _as_float(threshold)
+        else "pass"
+    )
+    return {
+        "status": status,
+        "avg_expected_fill_probability": _average(fill_probabilities),
+        "avg_expected_edge_bps": avg_edge,
+        "min_expected_edge_bps": threshold,
+        "samples": max(len(fill_probabilities), len(edge_bps)),
+    }
+
+
+def _promotion_gate(events: List[Dict[str, Any]]) -> Dict[str, Any]:
+    inputs: Dict[str, Any] = {}
+    for event in events:
+        candidate = event.get("promotion_inputs")
+        if isinstance(candidate, dict):
+            inputs = candidate
+            break
+    shadow_passed = bool(inputs.get("shadow_passed", False))
+    live_canary_passed = bool(inputs.get("live_canary_passed", False))
+    after_cost_edge = _as_float(inputs.get("after_cost_edge_bps"))
+    min_after_cost_edge = _as_float(inputs.get("min_after_cost_edge_bps"))
+    after_cost_edge_pass = after_cost_edge >= min_after_cost_edge
+    cross_venue_safe = bool(inputs.get("cross_venue_safe", False))
+    requested_capital = _as_float(inputs.get("requested_capital_usdc"))
+    approved_capital = _as_float(inputs.get("approved_capital_usdc"))
+    capital_increase_allowed = (
+        shadow_passed
+        and live_canary_passed
+        and after_cost_edge_pass
+        and cross_venue_safe
+        and requested_capital <= approved_capital
+    )
+    multi_venue_allowed = capital_increase_allowed and cross_venue_safe
+    reason_codes: List[str] = []
+    if not shadow_passed:
+        reason_codes.append("shadow_not_passed")
+    if not live_canary_passed:
+        reason_codes.append("live_canary_not_passed")
+    if not after_cost_edge_pass:
+        reason_codes.append("after_cost_edge_below_floor")
+    if not cross_venue_safe:
+        reason_codes.append("cross_venue_not_safe")
+    if requested_capital > approved_capital:
+        reason_codes.append("capital_request_above_limit")
+    return {
+        "shadow_passed": shadow_passed,
+        "live_canary_passed": live_canary_passed,
+        "after_cost_edge_pass": after_cost_edge_pass,
+        "cross_venue_safe": cross_venue_safe,
+        "capital_increase_allowed": capital_increase_allowed,
+        "multi_venue_allowed": multi_venue_allowed,
+        "reason_codes": reason_codes,
+    }
 
 
 def evaluate_shadow_events(
@@ -145,6 +283,18 @@ def evaluate_shadow_events(
 
     reason_codes = sorted(set(failures + warnings))
     policy_version = policy.get("version") or _first_value(events, "policy_version")
+    route_quality = _route_quality(events, policy)
+    no_fill_exposure = _no_fill_exposure(events, policy)
+    expected_fill_edge = _expected_fill_edge(events, policy)
+    promotion_gate = _promotion_gate(events)
+    blockers: List[str] = []
+    if route_quality["status"] == "fail":
+        blockers.append("route_quality_below_floor")
+    if no_fill_exposure["status"] == "fail":
+        blockers.append("no_fill_exposure_over_policy")
+    if expected_fill_edge["status"] == "fail":
+        blockers.append("expected_edge_below_floor")
+    blockers.extend(promotion_gate["reason_codes"])
     return {
         "run_id": _first_value(events, "run_id", "unknown"),
         "started_at": events[0].get("timestamp") if events else None,
@@ -156,6 +306,17 @@ def evaluate_shadow_events(
         "policy_version": policy_version,
         "status": _status(bool(failures), bool(warnings)),
         "reason_codes": reason_codes,
+        "config_checksum": policy.get("config_checksum") or _first_value(events, "config_checksum"),
+        "control_validation": {
+            "static_config": _control_validation(events, "static_config"),
+            "signal_multipliers": _control_validation(events, "signal_multipliers"),
+            "quote_policy": _control_validation(events, "quote_policy_control"),
+        },
+        "route_quality": route_quality,
+        "no_fill_exposure": no_fill_exposure,
+        "expected_fill_edge": expected_fill_edge,
+        "blockers": sorted(set(blockers)),
+        "promotion_gate": promotion_gate,
         "event_count": len(events),
         "artifact_paths": {
             "capture": str(capture_path) if capture_path else None,

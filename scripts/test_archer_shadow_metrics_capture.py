@@ -100,6 +100,36 @@ class ArcherShadowMetricsCaptureTests(unittest.TestCase):
             self.assertEqual(len(lines), 1)
             self.assertEqual(json.loads(lines[0])["venue"], "archer")
 
+    def test_carries_replay_risk_and_portfolio_fields_when_present(self) -> None:
+        metrics = dashboard_metrics()
+        metrics["config_checksum"] = "sha256:fixture-config"
+        metrics["static_config"] = {"status": "pass", "checksum": "sha256:fixture-config"}
+        metrics["signal_multipliers"] = {"status": "pass", "size_multiplier": 0.8}
+        metrics["quote_policy_control"] = {"status": "pass", "version": "policy-2026-06-18"}
+        metrics["route_quality"] = {"score": 0.93, "best_route": "archer_direct"}
+        metrics["strategy"]["quote_decision"] = {"decision": "update_full", "reason_codes": ["normal_policy"]}
+        metrics["strategy"]["no_fill_exposure"] = {"bid_notional": 55.0, "ask_notional": 40.0}
+        metrics["strategy"]["expected_fill"] = {"probability": 0.22}
+        metrics["strategy"]["expected_edge"] = {"bps": 3.6}
+        metrics["portfolio_exposure"] = {
+            "base_net": 1.65,
+            "quote_net": 200.0,
+            "hedge_target": {"target_base_delta": -1.65},
+        }
+
+        event = build_capture_event(metrics, source="fixture.json")
+
+        self.assertEqual(event["config_checksum"], "sha256:fixture-config")
+        self.assertEqual(event["static_config"]["status"], "pass")
+        self.assertEqual(event["signal_multipliers"]["size_multiplier"], 0.8)
+        self.assertEqual(event["quote_policy_control"]["version"], "policy-2026-06-18")
+        self.assertEqual(event["route_quality"]["score"], 0.93)
+        self.assertEqual(event["quote_decision"]["decision"], "update_full")
+        self.assertEqual(event["no_fill_exposure"]["bid_notional"], 55.0)
+        self.assertEqual(event["expected_fill"]["probability"], 0.22)
+        self.assertEqual(event["expected_edge"]["bps"], 3.6)
+        self.assertEqual(event["portfolio_exposure"]["hedge_target"]["target_base_delta"], -1.65)
+
 
 if __name__ == "__main__":
     unittest.main()

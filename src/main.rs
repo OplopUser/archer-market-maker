@@ -1,9 +1,14 @@
+mod after_cost;
 mod archer;
 mod config;
+mod cross_venue;
 mod engine;
+mod evidence;
 mod feed;
 mod intel;
 mod policy;
+mod portfolio;
+mod promotion;
 mod quote_policy;
 mod readiness;
 mod routing;
