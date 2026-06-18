@@ -13,6 +13,7 @@ import copy
 import datetime as dt
 import functools
 import glob
+import hashlib
 import json
 import os
 import pathlib
@@ -85,6 +86,76 @@ def run_cmd(args: List[str], timeout: float = 8.0) -> Dict[str, Any]:
         }
     except Exception as exc:  # noqa: BLE001 - API should surface errors as data.
         return {"ok": False, "returncode": None, "stdout": "", "stderr": str(exc)}
+
+
+def config_checksum(path: pathlib.Path) -> str:
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    return f"sha256:{digest}"
+
+
+def git_value(*args: str) -> str:
+    result = run_cmd(["git", *args], timeout=2.0)
+    return result["stdout"].strip() if result["ok"] else ""
+
+
+def load_gate_artifact(env_name: str) -> Dict[str, Any]:
+    path_text = os.environ.get(env_name, "").strip()
+    if not path_text:
+        return {"passed": False, "source": None}
+    path = pathlib.Path(path_text).expanduser()
+    try:
+        artifact = json.loads(path.read_text(errors="replace"))
+        if isinstance(artifact, dict):
+            artifact.setdefault("source", str(path))
+            artifact["passed"] = artifact.get("passed") is True
+            return artifact
+    except Exception as exc:  # noqa: BLE001 - dashboard exposes health as data.
+        return {"passed": False, "source": str(path), "error": str(exc)}
+    return {"passed": False, "source": str(path), "error": "artifact is not a JSON object"}
+
+
+def build_provenance(config_path: pathlib.Path, policy_version: str) -> Dict[str, Any]:
+    return {
+        "source_branch": git_value("branch", "--show-current"),
+        "source_commit": git_value("rev-parse", "--short=12", "HEAD"),
+        "config_checksum": config_checksum(config_path),
+        "policy_version": policy_version,
+    }
+
+
+def build_readiness(
+    *,
+    config: Dict[str, Dict[str, Any]],
+    market: Dict[str, Any],
+    market_intel: Dict[str, Any],
+    certification: Dict[str, Any],
+    routing_proof: Dict[str, Any],
+) -> Dict[str, Any]:
+    shadow_mode = bool(config.get("execution", {}).get("shadow_mode", True))
+    mode = "shadow" if shadow_mode else "live"
+    certification_passed = certification.get("passed") is True
+    routing_proof_passed = routing_proof.get("passed") is True
+    policy_status = "accepted" if market_intel.get("ok") else "blocked"
+    live_approved = os.environ.get("ARCHER_LIVE_APPROVED", "").lower() == "true"
+    ready = (
+        market_intel.get("ok") is True
+        and certification_passed
+        and routing_proof_passed
+        and policy_status == "accepted"
+        and (mode != "live" or live_approved)
+    )
+    return {
+        "venue": "archer",
+        "market": market.get("market") or "unknown",
+        "mode": mode,
+        "status": f"ready_for_{mode}" if ready else "blocked",
+        "certification_passed": certification_passed,
+        "certification_artifact": certification.get("source"),
+        "routing_proof_passed": routing_proof_passed,
+        "routing_proof_artifact": routing_proof.get("source"),
+        "live_approved": live_approved,
+        "policy_status": policy_status,
+    }
 
 
 def base58_encode(raw: bytes) -> str:
@@ -544,12 +615,16 @@ class DashboardState:
                 "ok": True,
                 "url": url,
                 "mode": signal.get("mode"),
+                "version": signal.get("version"),
                 "quote_enabled": recommendation.get("quote_enabled"),
                 "fair_value": recommendation.get("fair_value"),
                 "spread_add_bps": recommendation.get("spread_add_bps"),
                 "size_multiplier": recommendation.get("size_multiplier"),
                 "bid_size_multiplier": recommendation.get("bid_size_multiplier"),
                 "ask_size_multiplier": recommendation.get("ask_size_multiplier"),
+                "quote_policy_version": (signal.get("quote_policy") or {}).get("version"),
+                "route_quality": signal.get("route_quality") or {},
+                "sources": signal.get("sources") or {},
                 "summary": recommendation.get("summary"),
                 "reasons": recommendation.get("reasons") or [],
             }
@@ -909,6 +984,21 @@ class DashboardState:
         process = self.get_process_state()
         logs = self.get_logs()
         market_intel = self.get_market_intel()
+        certification = load_gate_artifact("ARCHER_CERTIFICATION_ARTIFACT")
+        routing_proof = load_gate_artifact("ARCHER_ROUTING_PROOF_ARTIFACT")
+        policy_version = (
+            market_intel.get("quote_policy_version")
+            or self.config.get("strategy", {}).get("quote_policy_version")
+            or "propamm.quote-policy.v1"
+        )
+        provenance = build_provenance(self.config_path, str(policy_version))
+        readiness = build_readiness(
+            config=self.config,
+            market=status,
+            market_intel=market_intel,
+            certification=certification,
+            routing_proof=routing_proof,
+        )
         run_end = self.run_start + dt.timedelta(seconds=self.duration_seconds) if self.run_start else None
         elapsed = (now_utc() - self.run_start).total_seconds() if self.run_start else None
         progress = (
@@ -947,6 +1037,10 @@ class DashboardState:
             },
             "transactions": transactions,
             "market_intel": market_intel,
+            "readiness": readiness,
+            "provenance": provenance,
+            "certification": certification,
+            "routing_proof": routing_proof,
             "process": process,
             "logs": logs,
             "strategy": {

@@ -24,7 +24,7 @@ pub struct Strategy {
     risk: RiskSettings,
 }
 
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq)]
 pub struct IntelAdjustments {
     pub spread_add_bps: f64,
     pub size_multiplier: f64,

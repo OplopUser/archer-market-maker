@@ -155,6 +155,29 @@ def validate_metrics(metrics: dict[str, Any], args: argparse.Namespace) -> list[
                 f"market-intel spread_add {spread_add:.2f}bps < {args.min_market_intel_spread_add_bps:.2f}bps"
             )
 
+    if args.require_readiness_provenance:
+        readiness = metrics.get("readiness", {})
+        if readiness.get("venue") != "archer":
+            failures.append(f"readiness venue is not archer: {readiness.get('venue')}")
+        if readiness.get("status") not in {"ready_for_shadow", "ready_for_live"}:
+            failures.append(f"readiness status is not ready: {readiness.get('status')}")
+        if readiness.get("certification_passed") is not True:
+            failures.append("venue certification has not passed")
+        if readiness.get("routing_proof_passed") is not True:
+            failures.append("cross-venue routing proof has not passed")
+        if readiness.get("policy_status") != "accepted":
+            failures.append(f"policy status is not accepted: {readiness.get('policy_status')}")
+        if readiness.get("mode") == "live" and readiness.get("live_approved") is not True:
+            failures.append("live approval missing for live readiness mode")
+
+        provenance = metrics.get("provenance", {})
+        if not str(provenance.get("source_commit", "")).strip():
+            failures.append("source commit is missing")
+        if not str(provenance.get("config_checksum", "")).startswith("sha256:"):
+            failures.append("config checksum is missing or not sha256")
+        if provenance.get("policy_version") != "propamm.quote-policy.v1":
+            failures.append(f"policy version is unsupported: {provenance.get('policy_version')}")
+
     logs = metrics.get("logs", {}).get("counts", {})
     limits = {
         "price_feed_stale": args.max_price_feed_stale,
@@ -197,12 +220,14 @@ def main() -> None:
     parser.add_argument("--allow-live-book", action="store_true")
     parser.add_argument("--allow-market-owner-mismatch", action="store_true")
     parser.add_argument("--allow-missing-market-intel", action="store_true")
+    parser.add_argument("--allow-missing-readiness-provenance", action="store_true")
     args = parser.parse_args()
     args.require_no_bot = not args.allow_running_bot
     args.require_no_controller = not args.allow_running_controller
     args.require_clear_book = not args.allow_live_book
     args.require_owner_match = not args.allow_market_owner_mismatch
     args.require_market_intel = not args.allow_missing_market_intel
+    args.require_readiness_provenance = not args.allow_missing_readiness_provenance
 
     metrics, failures = wait_for_valid_metrics(args)
     if failures:

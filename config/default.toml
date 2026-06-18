@@ -35,6 +35,8 @@ binance_symbol = "SOLUSDT"
 # Optional local shared market-intel feed. When set, Archer reads fair value
 # from this service instead of opening its own Binance websocket.
 # market_intel_signal_url = "http://market-intel:8790/api/signals/sol_usdc"
+# market_intel_pair = "SOL/USDC"
+# require_market_intel = false
 # market_intel_poll_ms = 2000
 
 # If no price update for this long, pull all quotes.

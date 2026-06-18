@@ -10,6 +10,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
 
 use crate::config::FeedSettings;
+use crate::intel::{MarketIntelRejectReason, MarketIntelSignal};
 use crate::state::{SharedState, now_us};
 use crate::volatility::VolatilityTracker;
 
@@ -58,14 +59,6 @@ fn json_positive_f64_at(value: &Value, path: &str) -> Option<f64> {
     json_finite_f64_at(value, path).filter(|value| *value > 0.0)
 }
 
-fn json_bool_at(value: &Value, path: &str) -> Option<bool> {
-    value.pointer(path).and_then(Value::as_bool)
-}
-
-fn json_str_at<'a>(value: &'a Value, path: &str) -> Option<&'a str> {
-    value.pointer(path).and_then(Value::as_str)
-}
-
 fn bounded_multiplier(value: Option<f64>, fallback: f64) -> f64 {
     value
         .filter(|v| v.is_finite())
@@ -85,9 +78,25 @@ fn market_intel_price(signal: &Value) -> Option<f64> {
     .find_map(|path| json_positive_f64_at(signal, path))
 }
 
+fn market_intel_expected_pair(configured_pair: &str, binance_symbol: &str) -> String {
+    let configured_pair = configured_pair.trim();
+    if !configured_pair.is_empty() {
+        return configured_pair.to_string();
+    }
+    let symbol = binance_symbol.trim().to_uppercase();
+    for suffix in ["USDT", "USDC", "USD"] {
+        if let Some(base) = symbol.strip_suffix(suffix) {
+            return format!("{base}/USDC");
+        }
+    }
+    symbol
+}
+
 async fn run_market_intel_feed(
     state: Arc<SharedState>,
     url: String,
+    expected_pair: String,
+    max_signal_age_us: u64,
     poll_ms: u64,
     vol_window: usize,
     cancel: CancellationToken,
@@ -106,7 +115,7 @@ async fn run_market_intel_feed(
     let mut vol_tracker = VolatilityTracker::new(vol_window);
     let mut failures = 0u64;
 
-    tracing::info!(%url, poll_ms = poll.as_millis(), "Using market-intel price feed");
+    tracing::info!(%url, %expected_pair, poll_ms = poll.as_millis(), "Using typed market-intel price feed");
     loop {
         if cancel.is_cancelled() {
             return;
@@ -125,58 +134,58 @@ async fn run_market_intel_feed(
 
         match result {
             Ok(signal) => {
-                let quote_enabled =
-                    json_bool_at(&signal, "/recommendation/quote_enabled").unwrap_or(true);
-                let mode = json_str_at(&signal, "/mode").unwrap_or("unknown");
-                if !quote_enabled || mode == "pause" {
-                    failures = failures.saturating_add(1);
-                    state.feed_alive.store(false, Relaxed);
-                    state.intel_size_multiplier.store(0.0, Relaxed);
-                    state.intel_bid_size_multiplier.store(0.0, Relaxed);
-                    state.intel_ask_size_multiplier.store(0.0, Relaxed);
-                    state.price_notify.notify_one();
-                    if failures == 1 || failures % 30 == 0 {
-                        tracing::warn!(mode, quote_enabled, "market-intel signal is not quoteable");
+                match MarketIntelSignal::from_value(
+                    &signal,
+                    &expected_pair,
+                    now_us(),
+                    max_signal_age_us,
+                ) {
+                    Ok(accepted) => {
+                        handle_tick(
+                            &state,
+                            &mut vol_tracker,
+                            accepted.fair_value,
+                            accepted.fair_value,
+                        );
+                        state
+                            .intel_spread_add_bps
+                            .store(accepted.adjustments.spread_add_bps, Relaxed);
+                        state
+                            .intel_size_multiplier
+                            .store(accepted.adjustments.size_multiplier, Relaxed);
+                        state
+                            .intel_bid_size_multiplier
+                            .store(accepted.adjustments.bid_size_multiplier, Relaxed);
+                        state
+                            .intel_ask_size_multiplier
+                            .store(accepted.adjustments.ask_size_multiplier, Relaxed);
+                        state.price_notify.notify_one();
+                        failures = 0;
+                        if !state.feed_alive.load(Relaxed) {
+                            state.feed_alive.store(true, Relaxed);
+                        }
                     }
-                } else if let Some(price) = market_intel_price(&signal) {
-                    handle_tick(&state, &mut vol_tracker, price, price);
-                    state.intel_spread_add_bps.store(
-                        json_finite_f64_at(&signal, "/recommendation/spread_add_bps")
-                            .filter(|v| v.is_finite())
-                            .unwrap_or(0.0),
-                        Relaxed,
-                    );
-                    state.intel_size_multiplier.store(
-                        bounded_multiplier(
-                            json_finite_f64_at(&signal, "/recommendation/size_multiplier"),
-                            1.0,
-                        ),
-                        Relaxed,
-                    );
-                    state.intel_bid_size_multiplier.store(
-                        bounded_multiplier(
-                            json_finite_f64_at(&signal, "/recommendation/bid_size_multiplier"),
-                            1.0,
-                        ),
-                        Relaxed,
-                    );
-                    state.intel_ask_size_multiplier.store(
-                        bounded_multiplier(
-                            json_finite_f64_at(&signal, "/recommendation/ask_size_multiplier"),
-                            1.0,
-                        ),
-                        Relaxed,
-                    );
-                    state.price_notify.notify_one();
-                    failures = 0;
-                    if !state.feed_alive.load(Relaxed) {
-                        state.feed_alive.store(true, Relaxed);
-                    }
-                } else {
-                    failures = failures.saturating_add(1);
-                    state.feed_alive.store(false, Relaxed);
-                    if failures == 1 || failures % 30 == 0 {
-                        tracing::warn!("market-intel signal did not include a usable price");
+                    Err(reject) => {
+                        failures = failures.saturating_add(1);
+                        state.feed_alive.store(false, Relaxed);
+                        state.intel_size_multiplier.store(0.0, Relaxed);
+                        state.intel_bid_size_multiplier.store(0.0, Relaxed);
+                        state.intel_ask_size_multiplier.store(0.0, Relaxed);
+                        state.price_notify.notify_one();
+                        if failures == 1 || failures % 30 == 0 {
+                            tracing::warn!(
+                                ?reject.reason,
+                                detail = %reject.detail,
+                                "market-intel signal rejected by typed Archer validator"
+                            );
+                        }
+                        if matches!(
+                            reject.reason,
+                            MarketIntelRejectReason::Paused
+                                | MarketIntelRejectReason::QuoteDisabled
+                        ) {
+                            state.intel_spread_add_bps.store(0.0, Relaxed);
+                        }
                     }
                 }
             }
@@ -231,6 +240,15 @@ mod tests {
         assert_eq!(bounded_multiplier(Some(0.45), 1.0), 0.45);
         assert_eq!(bounded_multiplier(None, 1.0), 1.0);
     }
+
+    #[test]
+    fn derives_archer_signal_pair_from_binance_symbol() {
+        assert_eq!(market_intel_expected_pair("", "SOLUSDT"), "SOL/USDC");
+        assert_eq!(
+            market_intel_expected_pair("SOL/USDC", "SOLUSDT"),
+            "SOL/USDC"
+        );
+    }
 }
 
 pub async fn run_feed(
@@ -248,6 +266,8 @@ pub async fn run_feed(
         run_market_intel_feed(
             state,
             url.to_string(),
+            market_intel_expected_pair(&config.market_intel_pair, &config.binance_symbol),
+            config.staleness_timeout_ms.saturating_mul(1000),
             config.market_intel_poll_ms,
             vol_window,
             cancel,
