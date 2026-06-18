@@ -37,6 +37,7 @@ def preflight_command(
     mode: str,
     run_id: str,
     config_file: str,
+    phase: str,
     envelope_file: str = "",
     rollback_command: str = "",
 ) -> list[str]:
@@ -52,6 +53,12 @@ def preflight_command(
         "--config-file",
         rel(config_file),
     ]
+    if phase == "static":
+        command.append("--static-only")
+    elif phase == "post-start":
+        command.append("--post-start")
+    else:
+        raise ValueError(f"unknown preflight phase: {phase}")
     if rollback_command:
         command.extend(["--rollback-command", rollback_command])
     if envelope_file:
@@ -61,6 +68,10 @@ def preflight_command(
 
 def docker_compose(compose_file: str, *args: str) -> list[str]:
     return ["docker", "compose", "-f", rel(compose_file), *args]
+
+
+def with_env(command: list[str], **env: str) -> list[str]:
+    return ["env", *[f"{key}={value}" for key, value in env.items()], *command]
 
 
 def require_canary_gates(env: dict[str, str], confirm_live_canary: bool) -> None:
@@ -101,17 +112,32 @@ def build_plan(
                 mode="shadow",
                 run_id=run_id,
                 config_file=shadow_config,
+                phase="static",
             )
         )
         commands.append(
-            docker_compose(
-                compose_file,
-                "--profile",
-                "shadow",
-                "up",
-                "-d",
-                "archer-dashboard",
-                "archer-shadow-runner",
+            with_env(
+                docker_compose(
+                    compose_file,
+                    "--profile",
+                    "shadow",
+                    "up",
+                    "-d",
+                    "archer-dashboard",
+                    "archer-shadow-runner",
+                ),
+                ARCHER_RUN_ID=run_id,
+                ARCHER_RUN_MODE="shadow",
+                ARCHER_DASHBOARD_CONFIG=rel(shadow_config),
+                ARCHER_SHADOW_CONFIG=rel(shadow_config),
+            )
+        )
+        commands.append(
+            preflight_command(
+                mode="shadow",
+                run_id=run_id,
+                config_file=shadow_config,
+                phase="post-start",
             )
         )
         notes.append("Shadow start does not set ARCHER_ENABLE_LIVE_TRADING and runs --shadow.")
@@ -124,19 +150,40 @@ def build_plan(
                 mode="canary",
                 run_id=run_id,
                 config_file=canary_config,
+                phase="static",
                 envelope_file=envelope_file,
                 rollback_command=rollback_command,
             )
         )
         commands.append(
-            docker_compose(
-                compose_file,
-                "--profile",
-                "capped-live",
-                "up",
-                "-d",
-                "archer-dashboard",
-                "archer-canary-runner",
+            with_env(
+                docker_compose(
+                    compose_file,
+                    "--profile",
+                    "capped-live",
+                    "up",
+                    "-d",
+                    "archer-dashboard",
+                    "archer-canary-runner",
+                ),
+                ARCHER_RUN_ID=run_id,
+                ARCHER_RUN_MODE="canary",
+                ARCHER_DASHBOARD_CONFIG=rel(canary_config),
+                ARCHER_CANARY_CONFIG=rel(canary_config),
+                ARCHER_CANARY_ENVELOPE=rel(envelope_file),
+                ARCHER_ENABLE_LIVE_TRADING=env["ARCHER_ENABLE_LIVE_TRADING"],
+                ARCHER_CANARY_PROFILE=env["ARCHER_CANARY_PROFILE"],
+                ARCHER_CANARY_APPROVAL_ID=env["ARCHER_CANARY_APPROVAL_ID"],
+            )
+        )
+        commands.append(
+            preflight_command(
+                mode="canary",
+                run_id=run_id,
+                config_file=canary_config,
+                phase="post-start",
+                envelope_file=envelope_file,
+                rollback_command=rollback_command,
             )
         )
         notes.append("Canary start is gated by live env, canary profile, approval id, and envelope.")

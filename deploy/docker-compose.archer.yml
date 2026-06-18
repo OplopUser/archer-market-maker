@@ -24,6 +24,7 @@ services:
       - ${ARCHER_DASHBOARD_CONFIG:-config/default.toml}
     environment:
       ARCHER_SERVICE_ROLE: dashboard
+      ARCHER_RUN_ID: ${ARCHER_RUN_ID:-}
       ARCHER_RUN_MODE: ${ARCHER_RUN_MODE:-stopped}
       ARCHER_ENABLE_LIVE_TRADING: "false"
     ports:

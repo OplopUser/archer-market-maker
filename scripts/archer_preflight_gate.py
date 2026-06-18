@@ -12,7 +12,7 @@ import socket
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 
 def as_float(value: Any, default: float = math.nan) -> float:
@@ -24,7 +24,18 @@ def as_float(value: Any, default: float = math.nan) -> float:
 
 def load_metrics_once(args: argparse.Namespace) -> dict[str, Any]:
     if args.metrics_file:
-        return json.loads(Path(args.metrics_file).read_text(errors="replace"))
+        metrics_path = Path(args.metrics_file)
+        try:
+            metrics = json.loads(metrics_path.read_text(errors="replace"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise SystemExit(
+                f"PRE-FLIGHT FAIL\n  metrics file invalid: {metrics_path}: {exc}"
+            ) from exc
+        if not isinstance(metrics, dict):
+            raise SystemExit(
+                f"PRE-FLIGHT FAIL\n  metrics file invalid: {metrics_path}: root must be a JSON object"
+            )
+        return metrics
 
     with urllib.request.urlopen(args.metrics_url, timeout=args.timeout_seconds) as response:
         return json.loads(response.read().decode("utf-8"))
@@ -85,13 +96,32 @@ def load_simple_toml(path: Path) -> dict[str, dict[str, Any]]:
     return data
 
 
+def expected_mode_from(args: argparse.Namespace) -> str:
+    return (
+        str(getattr(args, "expected_mode", "") or "")
+        or os.environ.get("ARCHER_EXPECTED_MODE", "")
+        or os.environ.get("ARCHER_RUN_MODE", "")
+    )
+
+
+def actual_mode_from(metrics: dict[str, Any]) -> Any:
+    run = metrics.get("run", {})
+    return run.get("mode") or metrics.get("mode") or os.environ.get("ARCHER_RUN_MODE")
+
+
+def normalize_path_text(path: Any) -> str:
+    if path is None:
+        return ""
+    return str(Path(str(path)).expanduser())
+
+
 def validate_local_artifacts(metrics: dict[str, Any], args: argparse.Namespace) -> list[str]:
     failures: list[str] = []
+    config: dict[str, dict[str, Any]] = {}
 
-    expected_mode = getattr(args, "expected_mode", "")
-    if expected_mode:
-        run = metrics.get("run", {})
-        actual_mode = run.get("mode") or metrics.get("mode")
+    expected_mode = expected_mode_from(args)
+    if expected_mode and not bool(getattr(args, "static_only", False)):
+        actual_mode = actual_mode_from(metrics)
         if actual_mode != expected_mode:
             failures.append(f"run mode {actual_mode} != expected {expected_mode}")
 
@@ -138,15 +168,28 @@ def validate_local_artifacts(metrics: dict[str, Any], args: argparse.Namespace) 
             if not envelope_path.exists():
                 failures.append(f"canary envelope is missing: {envelope_path}")
             else:
-                failures.extend(validate_canary_envelope(envelope_path, metrics, rollback_command))
+                failures.extend(
+                    validate_canary_envelope(
+                        envelope_path,
+                        metrics,
+                        rollback_command,
+                        config,
+                        include_metrics=not bool(getattr(args, "static_only", False)),
+                    )
+                )
 
     return failures
 
 
 def validate_canary_envelope(
-    envelope_path: Path, metrics: dict[str, Any], rollback_command: str
+    envelope_path: Path,
+    metrics: dict[str, Any],
+    rollback_command: str,
+    config: Optional[dict[str, dict[str, Any]]] = None,
+    include_metrics: bool = True,
 ) -> list[str]:
     failures: list[str] = []
+    config = config or {}
     try:
         envelope = load_simple_toml(envelope_path)
     except OSError as exc:
@@ -166,6 +209,8 @@ def validate_canary_envelope(
     if as_float(canary.get("max_tx_per_minute"), math.inf) > 2.0:
         failures.append("canary envelope tx budget exceeds first-live cap")
 
+    failures.extend(validate_config_against_canary_envelope(config, canary))
+
     coexistence = envelope.get("manifest_coexistence", {})
     if coexistence.get("same_market_rule") not in {
         "manifest_same_market_must_be_stopped",
@@ -178,17 +223,170 @@ def validate_canary_envelope(
     if rollback_command and envelope_rollback and rollback_command not in envelope_rollback:
         failures.append("rollback command does not match canary envelope")
 
-    status = metrics.get("status", {})
-    base_total = as_float(status.get("base_free"), 0.0) + as_float(status.get("base_locked"), 0.0)
-    quote_total = as_float(status.get("quote_free"), 0.0) + as_float(
-        status.get("quote_locked"), 0.0
-    )
-    max_wallet_base = as_float(canary.get("max_wallet_base"), math.inf)
-    max_wallet_quote = as_float(canary.get("max_wallet_quote"), math.inf)
-    if base_total > max_wallet_base:
-        failures.append(f"wallet base {base_total:.6f} exceeds canary envelope {max_wallet_base:.6f}")
-    if quote_total > max_wallet_quote:
-        failures.append(f"wallet quote {quote_total:.4f} exceeds canary envelope {max_wallet_quote:.4f}")
+    if include_metrics:
+        status = metrics.get("status", {})
+        base_total = as_float(status.get("base_free"), 0.0) + as_float(
+            status.get("base_locked"), 0.0
+        )
+        quote_total = as_float(status.get("quote_free"), 0.0) + as_float(
+            status.get("quote_locked"), 0.0
+        )
+        max_wallet_base = as_float(canary.get("max_wallet_base"), math.inf)
+        max_wallet_quote = as_float(canary.get("max_wallet_quote"), math.inf)
+        if base_total > max_wallet_base:
+            failures.append(
+                f"wallet base {base_total:.6f} exceeds canary envelope {max_wallet_base:.6f}"
+            )
+        if quote_total > max_wallet_quote:
+            failures.append(
+                f"wallet quote {quote_total:.4f} exceeds canary envelope {max_wallet_quote:.4f}"
+            )
+
+        failures.extend(validate_wallet_limits(envelope, metrics))
+        failures.extend(validate_wallet_readiness(metrics, config))
+
+    return failures
+
+
+def validate_config_against_canary_envelope(
+    config: dict[str, dict[str, Any]], canary: dict[str, Any]
+) -> list[str]:
+    if not config:
+        return []
+    failures: list[str] = []
+    market = config.get("market", {})
+    strategy = config.get("strategy", {})
+    risk = config.get("risk", {})
+    execution = config.get("execution", {})
+
+    expected_market = str(canary.get("market_pubkey", ""))
+    if expected_market and str(market.get("market_pubkey", "")) != expected_market:
+        failures.append(
+            f"config market_pubkey {market.get('market_pubkey')} != canary envelope {expected_market}"
+        )
+
+    levels = strategy.get("spread_levels_bps") or []
+    max_levels = as_float(canary.get("max_levels_per_side"), math.inf)
+    if isinstance(levels, list) and len(levels) > max_levels:
+        failures.append(f"config level count {len(levels)} exceeds canary envelope {max_levels:.0f}")
+
+    comparisons = [
+        (
+            "risk.max_quote_notional_per_level",
+            risk.get("max_quote_notional_per_level"),
+            canary.get("max_quote_notional_per_level"),
+            "<=",
+        ),
+        (
+            "risk.max_total_quote_notional",
+            risk.get("max_total_quote_notional"),
+            canary.get("max_total_quote_notional"),
+            "<=",
+        ),
+        (
+            "risk.min_base_reserve_pct",
+            risk.get("min_base_reserve_pct"),
+            canary.get("min_base_reserve_pct"),
+            ">=",
+        ),
+        (
+            "risk.min_quote_reserve_pct",
+            risk.get("min_quote_reserve_pct"),
+            canary.get("min_quote_reserve_pct"),
+            ">=",
+        ),
+        (
+            "execution.max_tx_per_minute",
+            execution.get("max_tx_per_minute"),
+            canary.get("max_tx_per_minute"),
+            "<=",
+        ),
+        (
+            "execution.max_update_tx_per_10min",
+            execution.get("max_update_tx_per_10min"),
+            canary.get("max_update_tx_per_10min"),
+            "<=",
+        ),
+    ]
+    for label, raw_value, raw_limit, op in comparisons:
+        if raw_value is None or raw_limit is None:
+            continue
+        value = as_float(raw_value)
+        limit = as_float(raw_limit)
+        if op == "<=" and value > limit:
+            failures.append(f"config {label} {value:g} exceeds canary envelope {limit:g}")
+        if op == ">=" and value < limit:
+            failures.append(f"config {label} {value:g} below canary envelope {limit:g}")
+
+    return failures
+
+
+def validate_wallet_limits(envelope: dict[str, dict[str, Any]], metrics: dict[str, Any]) -> list[str]:
+    wallet_limits = envelope.get("wallet_limits", {})
+    if not wallet_limits:
+        return []
+    failures: list[str] = []
+    wallet = metrics.get("wallet", {})
+    balances = wallet.get("balances") if isinstance(wallet, dict) else None
+    if not isinstance(balances, dict):
+        failures.append("wallet balances unavailable for canary envelope")
+        return failures
+
+    errors = balances.get("errors") or []
+    if errors:
+        failures.append(f"wallet balance errors: {errors}")
+
+    checks = [
+        ("native SOL", balances.get("native_sol"), wallet_limits.get("max_native_sol_fee_reserve")),
+        ("wsol", balances.get("wsol"), wallet_limits.get("max_wsol")),
+        ("usdc", balances.get("usdc"), wallet_limits.get("max_usdc")),
+    ]
+    for label, raw_value, raw_limit in checks:
+        if raw_limit is None:
+            continue
+        value = as_float(raw_value)
+        limit = as_float(raw_limit)
+        if not math.isfinite(value):
+            failures.append(f"wallet {label} balance unavailable")
+        elif value > limit:
+            failures.append(f"wallet {label} {value:g} exceeds canary envelope {limit:g}")
+
+    return failures
+
+
+def validate_wallet_readiness(
+    metrics: dict[str, Any], config: Optional[dict[str, dict[str, Any]]] = None
+) -> list[str]:
+    wallet = metrics.get("wallet", {})
+    if not isinstance(wallet, dict):
+        return []
+    failures: list[str] = []
+    config = config or {}
+
+    expected_keypair = config.get("market", {}).get("maker_keypair_path")
+    actual_keypair = wallet.get("keypair_path") or wallet.get("maker_keypair_path")
+    if expected_keypair and actual_keypair:
+        if normalize_path_text(actual_keypair) != normalize_path_text(expected_keypair):
+            failures.append(
+                f"wallet keypair {actual_keypair} != config maker_keypair_path {expected_keypair}"
+            )
+
+    token_accounts = wallet.get("token_accounts") or wallet.get("token_account_readiness") or {}
+    if isinstance(token_accounts, dict):
+        for label, state in token_accounts.items():
+            if isinstance(state, bool):
+                ready = state
+                error = ""
+            elif isinstance(state, dict):
+                ready = state.get("ready")
+                if ready is None and "exists" in state:
+                    ready = state.get("exists")
+                error = str(state.get("error") or "")
+            else:
+                continue
+            if ready is False:
+                suffix = f": {error}" if error else ""
+                failures.append(f"token account {label} is not ready{suffix}")
 
     return failures
 
@@ -201,6 +399,9 @@ def wait_for_valid_metrics(args: argparse.Namespace) -> tuple[dict[str, Any], li
     during the normal wait window so the start gate fails only on the final
     stable state.
     """
+
+    if getattr(args, "static_only", False):
+        return {}, validate_metrics({}, args)
 
     if args.metrics_file:
         metrics = load_metrics(args)
@@ -222,6 +423,20 @@ def wait_for_valid_metrics(args: argparse.Namespace) -> tuple[dict[str, Any], li
 def validate_metrics(metrics: dict[str, Any], args: argparse.Namespace) -> list[str]:
     failures: list[str] = []
     failures.extend(validate_local_artifacts(metrics, args))
+    if bool(getattr(args, "static_only", False)):
+        return failures
+
+    config: dict[str, dict[str, Any]] = {}
+    config_file = getattr(args, "config_file", "")
+    if config_file and Path(config_file).expanduser().exists():
+        try:
+            config = load_simple_toml(Path(config_file).expanduser())
+        except OSError:
+            config = {}
+
+    failures.extend(validate_source(metrics, args))
+    failures.extend(validate_wallet_readiness(metrics, config))
+    failures.extend(validate_supervisor(metrics))
 
     run = metrics.get("run", {})
     if args.expected_run_id and run.get("run_id") != args.expected_run_id:
@@ -320,6 +535,42 @@ def validate_metrics(metrics: dict[str, Any], args: argparse.Namespace) -> list[
     return failures
 
 
+def validate_source(metrics: dict[str, Any], args: argparse.Namespace) -> list[str]:
+    failures: list[str] = []
+    source = metrics.get("source") or metrics.get("build") or {}
+    expected_checksum = getattr(args, "expected_source_checksum", "") or os.environ.get(
+        "ARCHER_EXPECTED_SOURCE_CHECKSUM", ""
+    )
+    expected_commit = getattr(args, "expected_source_commit", "") or os.environ.get(
+        "ARCHER_EXPECTED_SOURCE_COMMIT", ""
+    )
+    if expected_checksum and source.get("checksum") != expected_checksum:
+        failures.append(f"source checksum {source.get('checksum')} != expected {expected_checksum}")
+    if expected_commit and source.get("commit") != expected_commit:
+        failures.append(f"source commit {source.get('commit')} != expected {expected_commit}")
+    return failures
+
+
+def validate_supervisor(metrics: dict[str, Any]) -> list[str]:
+    supervisor = metrics.get("supervisor", {})
+    if not isinstance(supervisor, dict):
+        return []
+    failures: list[str] = []
+    if "expected_active" in supervisor:
+        expected_active = bool(supervisor.get("expected_active"))
+        active = supervisor.get("active")
+        if active is not expected_active:
+            failures.append(f"supervisor active {active} != expected {expected_active}")
+
+    policy = supervisor.get("policy", {})
+    if isinstance(policy, dict):
+        if policy.get("ok") is False:
+            failures.append(f"supervisor policy is not ok: {policy.get('status')}")
+    elif supervisor.get("policy_ok") is False:
+        failures.append(f"supervisor policy is not ok: {supervisor.get('policy_status')}")
+    return failures
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--metrics-url", default="http://127.0.0.1:8787/api/metrics")
@@ -329,10 +580,20 @@ def main() -> None:
     parser.add_argument("--timeout-seconds", type=float, default=8.0)
     parser.add_argument("--expected-run-id", default="")
     parser.add_argument("--expected-mode", default="")
+    parser.add_argument("--static-only", action="store_true")
+    parser.add_argument("--post-start", action="store_true")
     parser.add_argument("--config-file", default="")
     parser.add_argument("--config-max-age-seconds", type=float, default=0.0)
     parser.add_argument("--canary-envelope-file", default="")
     parser.add_argument("--rollback-command", default="")
+    parser.add_argument(
+        "--expected-source-checksum",
+        default=os.environ.get("ARCHER_EXPECTED_SOURCE_CHECKSUM", ""),
+    )
+    parser.add_argument(
+        "--expected-source-commit",
+        default=os.environ.get("ARCHER_EXPECTED_SOURCE_COMMIT", ""),
+    )
     parser.add_argument("--expected-profile", default="overnight_balanced_low_churn")
     parser.add_argument("--min-effective-spread-bps", type=float, default=62.0)
     parser.add_argument("--min-market-intel-spread-add-bps", type=float, default=0.0)

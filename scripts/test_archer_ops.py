@@ -38,6 +38,23 @@ class ArcherOpsCommandTests(unittest.TestCase):
         self.assertIn("--profile shadow", " ".join(plan["commands"][1]))
         self.assertNotIn("ARCHER_ENABLE_LIVE_TRADING=true", str(plan))
 
+    def test_shadow_start_splits_static_and_post_start_preflight(self) -> None:
+        ops = load_ops_module()
+
+        plan = ops.build_plan(
+            "shadow-start",
+            run_id="test-shadow",
+            env={},
+            execute=False,
+            confirm_live_canary=False,
+        )
+
+        flattened = [" ".join(command) for command in plan["commands"]]
+        self.assertIn("--static-only", flattened[0])
+        self.assertIn("docker compose", flattened[1])
+        self.assertIn("--post-start", flattened[2])
+        self.assertTrue(plan["dry_run"])
+
     def test_canary_start_requires_live_gate_profile_and_approval(self) -> None:
         ops = load_ops_module()
 
@@ -49,6 +66,29 @@ class ArcherOpsCommandTests(unittest.TestCase):
                 execute=False,
                 confirm_live_canary=True,
             )
+
+    def test_canary_start_splits_static_and_post_start_preflight(self) -> None:
+        ops = load_ops_module()
+
+        plan = ops.build_plan(
+            "canary-start",
+            run_id="test-canary",
+            env={
+                "ARCHER_ENABLE_LIVE_TRADING": "true",
+                "ARCHER_CANARY_PROFILE": "first-live-sol-usdc",
+                "ARCHER_CANARY_APPROVAL_ID": "approval-123",
+            },
+            execute=False,
+            confirm_live_canary=True,
+        )
+
+        flattened = [" ".join(command) for command in plan["commands"]]
+        self.assertIn("--static-only", flattened[0])
+        self.assertIn("--require-canary-envelope", flattened[0])
+        self.assertIn("docker compose", flattened[1])
+        self.assertIn("--post-start", flattened[2])
+        self.assertIn("--require-canary-envelope", flattened[2])
+        self.assertTrue(plan["dry_run"])
 
         with self.assertRaisesRegex(ValueError, "ARCHER_CANARY_APPROVAL_ID"):
             ops.build_plan(

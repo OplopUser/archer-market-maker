@@ -928,7 +928,8 @@ class DashboardState:
             "config_path": str(self.config_path),
             "run": {
                 "run_dir": str(self.run_dir) if self.run_dir else None,
-                "run_id": run_id_from_dir(self.run_dir),
+                "run_id": os.environ.get("ARCHER_RUN_ID") or run_id_from_dir(self.run_dir),
+                "mode": os.environ.get("ARCHER_RUN_MODE"),
                 "start": iso(self.run_start) if self.run_start else None,
                 "expected_end": iso(run_end) if run_end else None,
                 "duration_seconds": self.duration_seconds,
