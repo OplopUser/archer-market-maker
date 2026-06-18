@@ -57,6 +57,18 @@ pub enum Cli {
         #[arg(long, default_value_t = 1.0)]
         intel_ask_size_multiplier: f64,
     },
+    /// Simulate a market-intel quote policy fixture into an Archer MakerBook update
+    SimulatePolicy {
+        /// JSON fixture containing policy, current state, market metadata, and simulator caps
+        #[arg(short, long)]
+        fixture: Option<PathBuf>,
+        /// Market maker config used for read-only live dry-run inputs
+        #[arg(short, long, default_value = "config/default.toml")]
+        config: PathBuf,
+        /// Build the simulation from live read-only HTTP/RPC inputs. Never signs or sends.
+        #[arg(long, default_value_t = false)]
+        dry_run_live: bool,
+    },
     /// Initialize your maker book on-chain (one-time)
     Init {
         #[arg(short, long, default_value = "config/default.toml")]
@@ -569,6 +581,7 @@ pub fn resolve_path(s: &str) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::Parser;
 
     fn config_text(shadow_mode: bool, require_market_intel: bool, url: &str) -> String {
         let url_line = if url.is_empty() {
@@ -626,5 +639,50 @@ log_level = "info"
         let config: MMConfig = toml::from_str(&config_text(true, false, "")).unwrap();
 
         validate_config(&config).expect("shadow/dev config can omit market-intel");
+    }
+
+    #[test]
+    fn simulate_policy_cli_accepts_live_dry_run_with_default_config() {
+        let cli = Cli::try_parse_from(["archer-market-maker", "simulate-policy", "--dry-run-live"])
+            .expect("simulate-policy live dry-run args should parse");
+
+        match cli {
+            Cli::SimulatePolicy {
+                fixture,
+                config,
+                dry_run_live,
+            } => {
+                assert!(fixture.is_none());
+                assert_eq!(config, PathBuf::from("config/default.toml"));
+                assert!(dry_run_live);
+            }
+            other => panic!("unexpected CLI variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn simulate_policy_cli_accepts_fixture_or_config() {
+        let cli = Cli::try_parse_from([
+            "archer-market-maker",
+            "simulate-policy",
+            "--config",
+            "config/default.toml",
+            "--fixture",
+            "policy.json",
+        ])
+        .expect("simulate-policy fixture args should parse");
+
+        match cli {
+            Cli::SimulatePolicy {
+                fixture,
+                config,
+                dry_run_live,
+            } => {
+                assert_eq!(fixture, Some(PathBuf::from("policy.json")));
+                assert_eq!(config, PathBuf::from("config/default.toml"));
+                assert!(!dry_run_live);
+            }
+            other => panic!("unexpected CLI variant: {other:?}"),
+        }
     }
 }

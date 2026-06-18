@@ -602,6 +602,75 @@ class DashboardState:
                 balances["errors"].append(f"{label}: {exc}")
         return balances
 
+    def get_token_account_readiness(self) -> Dict[str, Any]:
+        readiness: Dict[str, Any] = {}
+        if not self.rpc_url or self.wallet_pubkey == "unknown":
+            return {
+                "wsol": {"ready": False, "exists": False, "error": "missing RPC URL or wallet pubkey"},
+                "usdc": {"ready": False, "exists": False, "error": "missing RPC URL or wallet pubkey"},
+            }
+        for label, mint in [("wsol", WSOL_MINT), ("usdc", USDC_MINT)]:
+            try:
+                result = self.rpc_call(
+                    "getTokenAccountsByOwner",
+                    [
+                        self.wallet_pubkey,
+                        {"mint": mint},
+                        {"encoding": "jsonParsed", "commitment": "confirmed"},
+                    ],
+                    timeout=DASHBOARD_RPC_TIMEOUT,
+                )
+                exists = bool(result.get("value", []))
+                readiness[label] = {"ready": exists, "exists": exists}
+            except Exception as exc:  # noqa: BLE001
+                readiness[label] = {"ready": False, "exists": False, "error": str(exc)}
+        return readiness
+
+    def expected_active_profile(self, strategy_ledger: Dict[str, Any]) -> Optional[str]:
+        if strategy_ledger.get("active"):
+            return strategy_ledger.get("active", {}).get("profile")
+        return (
+            os.environ.get("ARCHER_EXPECTED_PROFILE")
+            or os.environ.get("ARCHER_CANARY_PROFILE")
+            or os.environ.get("ARCHER_INITIAL_PROFILE")
+        )
+
+    def source_identity(self) -> Dict[str, Any]:
+        return {
+            "commit": os.environ.get("ARCHER_SOURCE_COMMIT")
+            or os.environ.get("ARCHER_EXPECTED_SOURCE_COMMIT")
+            or "",
+            "checksum": os.environ.get("ARCHER_SOURCE_CHECKSUM")
+            or os.environ.get("ARCHER_EXPECTED_SOURCE_CHECKSUM")
+            or "",
+        }
+
+    def supervisor_state(self, process: Dict[str, Any], source: Dict[str, Any]) -> Dict[str, Any]:
+        mode = os.environ.get("ARCHER_RUN_MODE") or "stopped"
+        expected_active = mode in {"shadow", "canary", "controller"}
+        process_active = bool(
+            process.get("controller_running") if mode == "controller" else process.get("bot_running")
+        )
+        if mode == "controller":
+            active = process_active
+        elif mode in {"shadow", "canary"}:
+            active = process_active
+        else:
+            active = False
+        policy_ok = bool(source.get("commit") and source.get("checksum"))
+        if mode not in {"shadow", "canary"}:
+            policy_ok = True
+        return {
+            "mode": mode,
+            "expected_active": expected_active,
+            "active": active,
+            "process_active": process_active,
+            "policy": {
+                "ok": policy_ok,
+                "status": "ok" if policy_ok else "missing_source_identity",
+            },
+        }
+
     def get_market_intel(self) -> Dict[str, Any]:
         url = str(self.config.get("feed", {}).get("market_intel_signal_url") or "").strip()
         if not url:
@@ -978,9 +1047,14 @@ class DashboardState:
                 "usdc": None,
                 "errors": ["skipped because live Archer RPC/status is unhealthy"],
             }
+            token_accounts = {
+                "wsol": {"ready": False, "exists": False, "error": "skipped because live Archer RPC/status is unhealthy"},
+                "usdc": {"ready": False, "exists": False, "error": "skipped because live Archer RPC/status is unhealthy"},
+            }
         else:
             transactions = self.get_transactions()
             balances = self.get_wallet_balances()
+            token_accounts = self.get_token_account_readiness()
         process = self.get_process_state()
         logs = self.get_logs()
         market_intel = self.get_market_intel()
@@ -1008,6 +1082,9 @@ class DashboardState:
         )
 
         strategy_ledger = self.get_strategy_ledger()
+        active_profile = self.expected_active_profile(strategy_ledger)
+        source = self.source_identity()
+        supervisor = self.supervisor_state(process, source)
         active_settings = (
             strategy_ledger.get("active", {}).get("settings")
             if strategy_ledger.get("active")
@@ -1018,7 +1095,8 @@ class DashboardState:
             "config_path": str(self.config_path),
             "run": {
                 "run_dir": str(self.run_dir) if self.run_dir else None,
-                "run_id": run_id_from_dir(self.run_dir),
+                "run_id": os.environ.get("ARCHER_RUN_ID") or run_id_from_dir(self.run_dir),
+                "mode": os.environ.get("ARCHER_RUN_MODE"),
                 "start": iso(self.run_start) if self.run_start else None,
                 "expected_end": iso(run_end) if run_end else None,
                 "duration_seconds": self.duration_seconds,
@@ -1033,8 +1111,12 @@ class DashboardState:
             "pnl": self.compute_pnl(status, baseline, transactions, mid_price),
             "wallet": {
                 "pubkey": self.wallet_pubkey,
+                "keypair_path": self.wallet,
                 "balances": balances,
+                "token_accounts": token_accounts,
             },
+            "source": source,
+            "supervisor": supervisor,
             "transactions": transactions,
             "market_intel": market_intel,
             "readiness": readiness,
@@ -1044,9 +1126,7 @@ class DashboardState:
             "process": process,
             "logs": logs,
             "strategy": {
-                "active_profile": strategy_ledger.get("active", {}).get("profile")
-                if strategy_ledger.get("active")
-                else None,
+                "active_profile": active_profile,
                 "active_reason": strategy_ledger.get("active", {}).get("reason")
                 if strategy_ledger.get("active")
                 else None,
@@ -1162,6 +1242,62 @@ class DashboardState:
         finally:
             self.lock.release()
 
+    def propamm_status_payload(self) -> Dict[str, Any]:
+        metrics = self.collect_cached(force=False, record=False)
+        run = metrics.get("run") if isinstance(metrics.get("run"), dict) else {}
+        market = metrics.get("market") if isinstance(metrics.get("market"), dict) else {}
+        status = metrics.get("status") if isinstance(metrics.get("status"), dict) else {}
+        tx = metrics.get("transactions") if isinstance(metrics.get("transactions"), dict) else {}
+        market_intel = (
+            metrics.get("market_intel") if isinstance(metrics.get("market_intel"), dict) else {}
+        )
+        source = metrics.get("source") if isinstance(metrics.get("source"), dict) else {}
+        supervisor = metrics.get("supervisor") if isinstance(metrics.get("supervisor"), dict) else {}
+        metrics_age = None
+        metrics_time = metrics.get("time")
+        if isinstance(metrics_time, str):
+            try:
+                parsed = dt.datetime.fromisoformat(metrics_time.replace("Z", "+00:00"))
+                metrics_age = max(0.0, (now_utc() - parsed).total_seconds())
+            except ValueError:
+                metrics_age = None
+        makerbook_ok = bool(status.get("command_ok"))
+        tx_ok = bool(tx.get("ok", "failed_count" in tx or "since_start_count" in tx))
+        intel_ok = bool(market_intel.get("ok"))
+        return {
+            "venue": "archer",
+            "market": "SOL/USDC",
+            "mode": run.get("mode") or os.environ.get("ARCHER_RUN_MODE") or "unknown",
+            "dashboard_status": "up",
+            "metrics_age_secs": metrics_age,
+            "run": run,
+            "source": source,
+            "supervisor": supervisor,
+            "makerbook": {
+                "status": "ok" if makerbook_ok else "unknown",
+                "age_secs": metrics_age,
+                "active_bids": status.get("bid_levels"),
+                "active_asks": status.get("ask_levels"),
+                "base_total": status.get("base_total"),
+                "quote_total": status.get("quote_total"),
+                "market": status.get("market") or market.get("market_pubkey"),
+            },
+            "tx": {
+                "status": "ok" if tx_ok else "unknown",
+                "age_secs": metrics_age,
+                "submitted": tx.get("since_start_count", 0 if tx_ok else None),
+                "failed": tx.get("failed_count", 0 if tx_ok else None),
+            },
+            "market_intel": {
+                "status": "fresh" if intel_ok else "unknown",
+                "age_secs": metrics_age,
+                "mode": market_intel.get("mode"),
+                "quote_enabled": market_intel.get("quote_enabled"),
+                "fair_value": market_intel.get("fair_value"),
+                "spread_add_bps": market_intel.get("spread_add_bps"),
+            },
+        }
+
     def read_history(self, limit: int = 1000) -> List[Dict[str, Any]]:
         if not self.sample_path or not self.sample_path.exists():
             return []
@@ -1212,6 +1348,21 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 self.write_json(self.state.collect_cached(force=False, record=False))
             except Exception as exc:  # noqa: BLE001
                 self.write_json({"error": str(exc), "time": iso()}, status=500)
+            return
+        if parsed.path in {"/api/status", "/api/summary"}:
+            try:
+                self.write_json(self.state.propamm_status_payload())
+            except Exception as exc:  # noqa: BLE001
+                self.write_json(
+                    {
+                        "venue": "archer",
+                        "dashboard_status": "up",
+                        "mode": os.environ.get("ARCHER_RUN_MODE") or "unknown",
+                        "error": str(exc),
+                        "time": iso(),
+                    },
+                    status=200,
+                )
             return
         if parsed.path == "/api/history":
             query = urllib.parse.parse_qs(parsed.query)

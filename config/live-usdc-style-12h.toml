@@ -1,0 +1,66 @@
+# Source profile for the Archer adaptive validation controller.
+# Live execution remains blocked unless ARCHER_ENABLE_LIVE_TRADING=true.
+
+[market]
+market_pubkey = "u8tnfCb1JSSghuNFquQ2beStYgAN1kmd1f1Lhxbaec4"
+maker_keypair_path = "~/.config/solana/archer-canary.json"
+
+[connection]
+rpc_url = "https://api.mainnet-beta.solana.com"
+shared_blockhash_url = "http://market-intel:8790/api/solana/blockhash"
+
+[feed]
+binance_symbol = "SOLUSDT"
+cross_symbol = "USDCUSDT"
+market_intel_signal_url = "http://market-intel:8790/api/signals/archer_sol_usdc"
+market_intel_poll_ms = 2000
+staleness_timeout_ms = 15000
+
+[strategy]
+spread_levels_bps = [24.0, 42.0]
+inventory_pct = 25.0
+vol_window = 300
+vol_baseline_bps = 5.0
+vol_max_multiplier = 1.0
+intel_spread_add_multiplier = 1.0
+max_intel_spread_add_bps = 80.0
+max_intel_spread_tighten_bps = 0.0
+max_intel_side_spread_add_bps = 40.0
+min_effective_spread_bps = 62.0
+min_net_edge_bps = 0.0
+toxicity_buffer_bps = 0.0
+min_intel_size_multiplier = 0.20
+post_fill_cooldown_ms = 900000
+post_fill_side_size_multiplier = 0.0
+post_fill_markout_check_ms = 900000
+post_fill_adverse_markout_bps = 12.0
+post_fill_adverse_cooldown_ms = 3600000
+
+[risk]
+min_quote_notional = 8.0
+max_quote_notional_per_level = 18.0
+max_total_quote_notional = 90.0
+min_base_reserve_pct = 30.0
+min_quote_reserve_pct = 35.0
+
+[execution]
+heartbeat_interval_ms = 1000
+priority_fee_mode = "dynamic"
+priority_fee_microlamports = 100
+priority_fee_min_microlamports = 0
+priority_fee_max_microlamports = 5000
+priority_fee_percentile = 50
+priority_fee_cache_ms = 10000
+priority_fee_emergency_multiplier = 4
+maker_book_poll_interval_ms = 2000
+min_mid_update_interval_ms = 240000
+min_mid_update_ticks = 260
+min_full_refresh_interval_ms = 600000
+max_tx_per_minute = 20
+max_update_tx_per_10min = 4
+max_clear_book_per_5min = 2
+min_clear_book_interval_ms = 30000
+shadow_mode = true
+
+[monitoring]
+log_level = "info"
