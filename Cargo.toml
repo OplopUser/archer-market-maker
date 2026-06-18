@@ -26,6 +26,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
 reqwest = { version = "0.12", features = ["json"] }
+sha2 = "0.10"
 
 # Atomics (AtomicF64)
 portable-atomic = { version = "1", features = ["float"] }

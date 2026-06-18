@@ -1,0 +1,23 @@
+name: security
+
+on:
+  pull_request:
+  push:
+    branches:
+      - codex/propamm-archer-buildout
+
+jobs:
+  dependency-and-key-hygiene:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Key hygiene scan
+        run: python3 scripts/ci_key_hygiene.py
+      - name: Cargo dependency audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit

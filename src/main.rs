@@ -36,6 +36,7 @@ use crate::config::{Cli, load_config, resolve_path};
 use crate::state::SharedState;
 use crate::strategy::{IntelAdjustments, QuoteDecision, Strategy};
 use crate::tx::{TxPriority, TxSender};
+use archer_market_maker::ops_security::{LiveApprovalRequest, read_and_validate_live_approval};
 
 const LIVE_TRADING_ENV: &str = "ARCHER_ENABLE_LIVE_TRADING";
 const CU_INIT_MAKER_BOOK: u32 = 25_000;
@@ -743,6 +744,33 @@ fn require_live_tx_enabled(operation: &str) -> Result<()> {
     anyhow::ensure!(
         enabled,
         "{operation} blocked: set {LIVE_TRADING_ENV}=true explicitly"
+    );
+    let approval_path = std::env::var("ARCHER_LIVE_APPROVAL_PATH")
+        .map(|value| value.trim().to_string())
+        .unwrap_or_default();
+    anyhow::ensure!(
+        !approval_path.is_empty(),
+        "{operation} blocked: set ARCHER_LIVE_APPROVAL_PATH"
+    );
+    let market = std::env::var("ARCHER_LIVE_APPROVAL_MARKET").unwrap_or_else(|_| "ANY".to_string());
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or_default();
+    let decision = read_and_validate_live_approval(
+        approval_path,
+        &LiveApprovalRequest {
+            venue: "archer".to_string(),
+            market,
+            operation: operation.to_string(),
+            now_ms,
+            required_ticket_ids: vec!["T-162".to_string()],
+        },
+    )?;
+    anyhow::ensure!(
+        decision.approved,
+        "{operation} blocked by approval artifact: {:?}",
+        decision.reason_codes
     );
     Ok(())
 }
