@@ -9,6 +9,7 @@ use std::path::Path;
 const RPC_API_KEY_PATTERN: &str = concat!("api", "-key=");
 const RPC_APIKEY_PATTERN: &str = concat!("api", "key=");
 const ENV_FILE_MARKER: &str = concat!(".", "env");
+const HOME_PATH_MARKERS: [&str; 2] = [concat!("/", "users/"), concat!("/", "home/")];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LiveApprovalArtifact {
@@ -310,7 +311,11 @@ pub fn scan_secret_text(path: impl Into<String>, contents: &str) -> Vec<SecretSc
         if lower.contains(ENV_FILE_MARKER) {
             findings.push(finding(&path, index, "env_material_reference"));
         }
-        if lower.contains("keypair") && (lower.contains("/users/") || lower.contains("/home/")) {
+        if lower.contains("keypair")
+            && HOME_PATH_MARKERS
+                .iter()
+                .any(|marker| lower.contains(marker))
+        {
             findings.push(finding(&path, index, "wallet_path_literal"));
         }
     }

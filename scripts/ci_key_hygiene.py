@@ -9,6 +9,7 @@ from pathlib import Path
 RPC_KEY_MARKER = "api" + "-key="
 RPC_KEY_MARKER_COMPACT = "api" + "key="
 PRIVATE_KEY_MARKER = "PRIVATE" + " KEY"
+HOME_PATH_MARKERS = ("/" + "users/", "/" + "home/")
 SKIP_DIRS = {".git", "target", "node_modules", ".venv", "__pycache__"}
 ALLOW_MARKERS = {"REDACTED", "REPLACE_ME", "YOUR_KEY", "example.invalid"}
 ALLOW_MARKERS.update(
@@ -55,7 +56,7 @@ def scan_file(path: Path) -> list[str]:
             findings.append(f"{path}:{line_no}: rpc_api_key_literal")
         if PRIVATE_KEY_MARKER in line and not allowed(line):
             findings.append(f"{path}:{line_no}: private_key_material")
-        if "keypair" in lower and ("/users/" in lower or "/home/" in lower):
+        if "keypair" in lower and any(marker in lower for marker in HOME_PATH_MARKERS):
             findings.append(f"{path}:{line_no}: wallet_path_literal")
     return findings
 
