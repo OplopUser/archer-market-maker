@@ -1148,6 +1148,62 @@ class DashboardState:
         finally:
             self.lock.release()
 
+    def propamm_status_payload(self) -> Dict[str, Any]:
+        metrics = self.collect_cached(force=False, record=False)
+        run = metrics.get("run") if isinstance(metrics.get("run"), dict) else {}
+        market = metrics.get("market") if isinstance(metrics.get("market"), dict) else {}
+        status = metrics.get("status") if isinstance(metrics.get("status"), dict) else {}
+        tx = metrics.get("transactions") if isinstance(metrics.get("transactions"), dict) else {}
+        market_intel = (
+            metrics.get("market_intel") if isinstance(metrics.get("market_intel"), dict) else {}
+        )
+        source = metrics.get("source") if isinstance(metrics.get("source"), dict) else {}
+        supervisor = metrics.get("supervisor") if isinstance(metrics.get("supervisor"), dict) else {}
+        metrics_age = None
+        metrics_time = metrics.get("time")
+        if isinstance(metrics_time, str):
+            try:
+                parsed = dt.datetime.fromisoformat(metrics_time.replace("Z", "+00:00"))
+                metrics_age = max(0.0, (now_utc() - parsed).total_seconds())
+            except ValueError:
+                metrics_age = None
+        makerbook_ok = bool(status.get("command_ok"))
+        tx_ok = bool(tx.get("ok", "failed_count" in tx or "since_start_count" in tx))
+        intel_ok = bool(market_intel.get("ok"))
+        return {
+            "venue": "archer",
+            "market": "SOL/USDC",
+            "mode": run.get("mode") or os.environ.get("ARCHER_RUN_MODE") or "unknown",
+            "dashboard_status": "up",
+            "metrics_age_secs": metrics_age,
+            "run": run,
+            "source": source,
+            "supervisor": supervisor,
+            "makerbook": {
+                "status": "ok" if makerbook_ok else "unknown",
+                "age_secs": metrics_age,
+                "active_bids": status.get("bid_levels"),
+                "active_asks": status.get("ask_levels"),
+                "base_total": status.get("base_total"),
+                "quote_total": status.get("quote_total"),
+                "market": status.get("market") or market.get("market_pubkey"),
+            },
+            "tx": {
+                "status": "ok" if tx_ok else "unknown",
+                "age_secs": metrics_age,
+                "submitted": tx.get("since_start_count", 0 if tx_ok else None),
+                "failed": tx.get("failed_count", 0 if tx_ok else None),
+            },
+            "market_intel": {
+                "status": "fresh" if intel_ok else "unknown",
+                "age_secs": metrics_age,
+                "mode": market_intel.get("mode"),
+                "quote_enabled": market_intel.get("quote_enabled"),
+                "fair_value": market_intel.get("fair_value"),
+                "spread_add_bps": market_intel.get("spread_add_bps"),
+            },
+        }
+
     def read_history(self, limit: int = 1000) -> List[Dict[str, Any]]:
         if not self.sample_path or not self.sample_path.exists():
             return []
@@ -1198,6 +1254,21 @@ class DashboardHandler(SimpleHTTPRequestHandler):
                 self.write_json(self.state.collect_cached(force=False, record=False))
             except Exception as exc:  # noqa: BLE001
                 self.write_json({"error": str(exc), "time": iso()}, status=500)
+            return
+        if parsed.path in {"/api/status", "/api/summary"}:
+            try:
+                self.write_json(self.state.propamm_status_payload())
+            except Exception as exc:  # noqa: BLE001
+                self.write_json(
+                    {
+                        "venue": "archer",
+                        "dashboard_status": "up",
+                        "mode": os.environ.get("ARCHER_RUN_MODE") or "unknown",
+                        "error": str(exc),
+                        "time": iso(),
+                    },
+                    status=200,
+                )
             return
         if parsed.path == "/api/history":
             query = urllib.parse.parse_qs(parsed.query)

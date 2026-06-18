@@ -115,6 +115,49 @@ shadow_mode = true
         self.assertEqual(supervisor["active"], False)
         self.assertEqual(supervisor["process_active"], False)
 
+    def test_propamm_status_payload_is_lightweight_parent_dashboard_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "archer.toml"
+            config_path.write_text("[execution]\nshadow_mode = true\n", encoding="utf-8")
+
+            with mock.patch.dict(os.environ, {"ARCHER_RUN_MODE": "shadow"}, clear=False):
+                state = DashboardState(config_path, None, 30, 0, 0)
+                state.collect_cached = mock.Mock(
+                    return_value={
+                        "time": "2026-06-18T14:07:44Z",
+                        "run": {"mode": "shadow", "run_id": "archer-shadow"},
+                        "market": {"market_pubkey": "market-1"},
+                        "status": {
+                            "command_ok": True,
+                            "bid_levels": 1,
+                            "ask_levels": 2,
+                            "base_total": 0.5,
+                            "quote_total": 20.0,
+                        },
+                        "transactions": {"ok": True, "since_start_count": 0, "failed_count": 0},
+                        "market_intel": {
+                            "ok": True,
+                            "mode": "cautious",
+                            "quote_enabled": True,
+                            "fair_value": "70.1",
+                            "spread_add_bps": "12.3",
+                        },
+                        "source": {"commit": "deadbeef", "checksum": "abc123"},
+                        "supervisor": {"active": True, "mode": "shadow"},
+                    }
+                )
+
+                payload = state.propamm_status_payload()
+
+        self.assertEqual(payload["dashboard_status"], "up")
+        self.assertEqual(payload["mode"], "shadow")
+        self.assertEqual(payload["makerbook"]["status"], "ok")
+        self.assertEqual(payload["makerbook"]["active_bids"], 1)
+        self.assertEqual(payload["tx"]["status"], "ok")
+        self.assertEqual(payload["tx"]["submitted"], 0)
+        self.assertEqual(payload["market_intel"]["status"], "fresh")
+        self.assertEqual(payload["market_intel"]["mode"], "cautious")
+
 
 if __name__ == "__main__":
     unittest.main()
