@@ -57,6 +57,12 @@ pub enum Cli {
         #[arg(long, default_value_t = 1.0)]
         intel_ask_size_multiplier: f64,
     },
+    /// Simulate a market-intel quote policy fixture into an Archer MakerBook update
+    SimulatePolicy {
+        /// JSON fixture containing policy, current state, market metadata, and simulator caps
+        #[arg(short, long)]
+        fixture: PathBuf,
+    },
     /// Initialize your maker book on-chain (one-time)
     Init {
         #[arg(short, long, default_value = "config/default.toml")]

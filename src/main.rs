@@ -2,6 +2,8 @@ mod archer;
 mod config;
 mod engine;
 mod feed;
+mod quote_policy;
+mod simulator;
 mod state;
 mod strategy;
 mod tx;
@@ -28,6 +30,7 @@ use solana_sdk::signer::Signer;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{Cli, load_config, resolve_path};
+use crate::simulator::{SimulationFixture, simulate_fixture};
 use crate::state::SharedState;
 use crate::strategy::{IntelAdjustments, QuoteDecision, Strategy};
 use crate::tx::{TxPriority, TxSender};
@@ -105,6 +108,7 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Cli::SimulatePolicy { fixture } => cmd_simulate_policy(&fixture).await,
         Cli::Init { config } => cmd_init(&config).await,
         Cli::Deposit {
             config,
@@ -116,6 +120,16 @@ async fn main() -> Result<()> {
         Cli::Status { config } => cmd_status(&config).await,
         Cli::SetExpiry { config, slots } => cmd_set_expiry(&config, slots).await,
     }
+}
+
+async fn cmd_simulate_policy(fixture_path: &std::path::Path) -> Result<()> {
+    let contents = std::fs::read_to_string(fixture_path)
+        .with_context(|| format!("reading {}", fixture_path.display()))?;
+    let fixture: SimulationFixture = serde_json::from_str(&contents)
+        .with_context(|| format!("parsing {}", fixture_path.display()))?;
+    let output = simulate_fixture(fixture)?;
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
 }
 
 async fn cmd_run(config_path: &std::path::Path, shadow: bool, live: bool) -> Result<()> {
