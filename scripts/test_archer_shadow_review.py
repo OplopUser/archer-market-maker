@@ -143,6 +143,72 @@ class ArcherShadowReviewTests(unittest.TestCase):
 
         self.assertEqual(capture_once.call_count, 2)
 
+    def test_fixture_observation_keeps_writing_rows_until_fixed_window_expires(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            metrics_path = tmp_path / "dashboard-metrics.json"
+            output_dir = tmp_path / "captures"
+            metrics_path.write_text(
+                json.dumps(
+                    {
+                        "time": "2026-06-18T01:02:03Z",
+                        "run": {"run_id": "shadow-run-001"},
+                        "market": {"symbol": "SOL/USDC", "command_ok": True},
+                        "status": {"command_ok": True, "stale": False},
+                        "transactions": {"since_start_count": 0, "failed_count": 0},
+                    }
+                )
+            )
+
+            with mock.patch.object(archer_shadow_review.time, "sleep"):
+                with mock.patch.object(
+                    archer_shadow_review.time,
+                    "monotonic",
+                    side_effect=[0.0, 0.0, 0.6, 1.1],
+                ):
+                    run_shadow_observation(
+                        [str(metrics_path)],
+                        output_dir,
+                        run_id="shadow-run-001",
+                        observation_seconds=1,
+                        interval_seconds=0.5,
+                    )
+
+            capture_path = output_dir / "archer-shadow-shadow-run-001.jsonl"
+            self.assertGreater(len(capture_path.read_text().splitlines()), 1)
+
+    def test_policy_review_writes_loaded_policy_version_to_capture_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_path = Path(tmp)
+            metrics_path = tmp_path / "dashboard-metrics.json"
+            policy_path = tmp_path / "policy.json"
+            output_dir = tmp_path / "captures"
+            metrics_path.write_text(
+                json.dumps(
+                    {
+                        "time": "2026-06-18T01:02:03Z",
+                        "run": {"run_id": "shadow-run-001"},
+                        "market": {"symbol": "SOL/USDC", "command_ok": True},
+                        "status": {"command_ok": True, "stale": False},
+                        "transactions": {"since_start_count": 0, "failed_count": 0},
+                    }
+                )
+            )
+            policy_path.write_text(json.dumps({"version": "policy-from-review"}))
+
+            run_shadow_observation(
+                [str(metrics_path)],
+                output_dir,
+                run_id="shadow-run-001",
+                observation_seconds=0,
+                interval_seconds=0.5,
+                policy_path=policy_path,
+            )
+
+            capture_path = output_dir / "archer-shadow-shadow-run-001.jsonl"
+            rows = [json.loads(line) for line in capture_path.read_text().splitlines()]
+            self.assertEqual(rows[0]["policy_version"], "policy-from-review")
+
 
 if __name__ == "__main__":
     unittest.main()

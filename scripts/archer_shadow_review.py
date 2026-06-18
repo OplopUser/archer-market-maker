@@ -201,21 +201,23 @@ def run_shadow_observation(
     output_dir.mkdir(parents=True, exist_ok=True)
     capture_path = output_dir / f"archer-shadow-{run_id}.jsonl"
     review_path = output_dir / f"archer-shadow-{run_id}-review.json"
+    policy = load_policy(policy_path)
+    policy_version = policy.get("version")
 
     start = time.monotonic()
     source_index = 0
-    all_sources_are_files = all(
-        not (source.startswith("http://") or source.startswith("https://"))
-        for source in sources
-    )
     while True:
         source = sources[source_index % len(sources)]
-        capture_once(source, capture_path, run_id=run_id, market=market)
+        capture_once(
+            source,
+            capture_path,
+            run_id=run_id,
+            market=market,
+            policy_version=policy_version,
+        )
         source_index += 1
         elapsed = time.monotonic() - start
         if elapsed >= observation_seconds:
-            break
-        if all_sources_are_files and source_index >= len(sources):
             break
         time.sleep(max(0.0, min(interval_seconds, observation_seconds - elapsed)))
 
