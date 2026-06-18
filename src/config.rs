@@ -129,6 +129,10 @@ pub struct FeedSettings {
     pub binance_ws_url: String,
     #[serde(default)]
     pub market_intel_signal_url: Option<String>,
+    #[serde(default)]
+    pub market_intel_pair: String,
+    #[serde(default)]
+    pub require_market_intel: bool,
     #[serde(default = "default_market_intel_poll_ms")]
     pub market_intel_poll_ms: u64,
     #[serde(default = "default_staleness_ms")]
@@ -287,6 +291,28 @@ fn validate_config(c: &MMConfig) -> Result<()> {
     );
     anyhow::ensure!(!c.connection.rpc_url.is_empty(), "rpc_url required");
     anyhow::ensure!(!c.feed.binance_symbol.is_empty(), "binance_symbol required");
+    let market_intel_url_present = c
+        .feed
+        .market_intel_signal_url
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|url| !url.is_empty());
+    if !c.execution.shadow_mode {
+        anyhow::ensure!(
+            c.feed.require_market_intel,
+            "live Archer configs must require market-intel"
+        );
+        anyhow::ensure!(
+            market_intel_url_present,
+            "live Archer configs require market_intel_signal_url"
+        );
+    }
+    if c.feed.require_market_intel {
+        anyhow::ensure!(
+            market_intel_url_present,
+            "require_market_intel needs market_intel_signal_url"
+        );
+    }
     anyhow::ensure!(
         !c.strategy.spread_levels_bps.is_empty(),
         "need at least 1 spread level"
@@ -538,4 +564,67 @@ pub fn resolve_path(s: &str) -> PathBuf {
         }
     }
     PathBuf::from(s)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn config_text(shadow_mode: bool, require_market_intel: bool, url: &str) -> String {
+        let url_line = if url.is_empty() {
+            String::new()
+        } else {
+            format!("market_intel_signal_url = \"{url}\"\n")
+        };
+        format!(
+            r#"
+[market]
+market_pubkey = "u8tnfCb1JSSghuNFquQ2beStYgAN1kmd1f1Lhxbaec4"
+maker_keypair_path = "fixture-keypair.json"
+
+[connection]
+rpc_url = "https://api.mainnet-beta.solana.com"
+
+[feed]
+binance_symbol = "SOLUSDT"
+require_market_intel = {require_market_intel}
+{url_line}
+
+[strategy]
+spread_levels_bps = [62.0, 80.0]
+
+[execution]
+shadow_mode = {shadow_mode}
+
+[monitoring]
+log_level = "info"
+"#
+        )
+    }
+
+    #[test]
+    fn live_config_requires_market_intel_url_and_flag() {
+        let missing_flag: MMConfig = toml::from_str(&config_text(false, false, "")).unwrap();
+        assert!(
+            validate_config(&missing_flag)
+                .unwrap_err()
+                .to_string()
+                .contains("market-intel")
+        );
+
+        let missing_url: MMConfig = toml::from_str(&config_text(false, true, "")).unwrap();
+        assert!(
+            validate_config(&missing_url)
+                .unwrap_err()
+                .to_string()
+                .contains("market_intel_signal_url")
+        );
+    }
+
+    #[test]
+    fn shadow_config_can_keep_dev_binance_fallback() {
+        let config: MMConfig = toml::from_str(&config_text(true, false, "")).unwrap();
+
+        validate_config(&config).expect("shadow/dev config can omit market-intel");
+    }
 }

@@ -32,6 +32,7 @@ def args(**overrides: object) -> argparse.Namespace:
         "require_clear_book": True,
         "require_owner_match": True,
         "require_market_intel": True,
+        "require_readiness_provenance": True,
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -66,6 +67,22 @@ def healthy_metrics() -> dict:
             "fair_value": "80.1",
             "spread_add_bps": "12.0",
         },
+        "readiness": {
+            "venue": "archer",
+            "market": "SOL/USDC",
+            "mode": "shadow",
+            "status": "ready_for_shadow",
+            "certification_passed": True,
+            "routing_proof_passed": True,
+            "live_approved": False,
+            "policy_status": "accepted",
+        },
+        "provenance": {
+            "source_branch": "codex/archer-certification",
+            "source_commit": "abc1234",
+            "config_checksum": "sha256:test-config",
+            "policy_version": "propamm.quote-policy.v1",
+        },
         "logs": {
             "counts": {
                 "price_feed_stale": 0,
@@ -97,6 +114,25 @@ class ArcherPreflightGateTests(unittest.TestCase):
         self.assertTrue(any("book is not clear" in failure for failure in failures))
         self.assertTrue(any("tightest effective spread" in failure for failure in failures))
         self.assertTrue(any("rpc_429" in failure for failure in failures))
+
+    def test_rejects_missing_readiness_provenance_or_routing_proof(self) -> None:
+        metrics = healthy_metrics()
+        metrics["readiness"]["routing_proof_passed"] = False
+        metrics["provenance"]["config_checksum"] = ""
+
+        failures = validate_metrics(metrics, args())
+
+        self.assertTrue(any("routing proof" in failure for failure in failures))
+        self.assertTrue(any("config checksum" in failure for failure in failures))
+
+    def test_rejects_live_mode_without_live_approval(self) -> None:
+        metrics = healthy_metrics()
+        metrics["readiness"]["mode"] = "live"
+        metrics["readiness"]["status"] = "ready_for_live"
+
+        failures = validate_metrics(metrics, args())
+
+        self.assertTrue(any("live approval" in failure for failure in failures))
 
     def test_waits_for_valid_metrics_after_partial_dashboard_snapshot(self) -> None:
         partial = healthy_metrics()
