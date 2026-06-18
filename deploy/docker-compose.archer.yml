@@ -1,0 +1,118 @@
+name: propamm-archer
+
+x-archer-common: &archer-common
+  build:
+    context: ..
+  working_dir: /app
+  volumes:
+    - ../logs:/app/logs
+    - ../config:/app/config:ro
+  restart: "no"
+
+services:
+  archer-dashboard:
+    <<: *archer-common
+    profiles: ["stopped", "shadow", "capped-live", "controller", "emergency-clear"]
+    command:
+      - python3
+      - dashboard/server.py
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8787"
+      - --config
+      - ${ARCHER_DASHBOARD_CONFIG:-config/default.toml}
+    environment:
+      ARCHER_SERVICE_ROLE: dashboard
+      ARCHER_RUN_MODE: ${ARCHER_RUN_MODE:-stopped}
+      ARCHER_ENABLE_LIVE_TRADING: "false"
+    ports:
+      - "${ARCHER_DASHBOARD_PORT:-8787}:8787"
+    healthcheck:
+      test:
+        - CMD
+        - python3
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8787/api/metrics', timeout=3)"
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  archer-shadow-runner:
+    <<: *archer-common
+    profiles: ["shadow"]
+    depends_on:
+      archer-dashboard:
+        condition: service_started
+    command:
+      - target/release/archer-market-maker
+      - run
+      - --config
+      - ${ARCHER_SHADOW_CONFIG:-config/default.toml}
+      - --shadow
+    environment:
+      ARCHER_SERVICE_ROLE: shadow-runner
+      ARCHER_RUN_MODE: shadow
+      ARCHER_ENABLE_LIVE_TRADING: "false"
+    restart: on-failure
+
+  archer-canary-runner:
+    <<: *archer-common
+    profiles: ["capped-live"]
+    depends_on:
+      archer-dashboard:
+        condition: service_started
+    command:
+      - /bin/sh
+      - -ec
+      - |
+        test "$$ARCHER_ENABLE_LIVE_TRADING" = "true"
+        test "$$ARCHER_CANARY_PROFILE" = "first-live-sol-usdc"
+        test "$$ARCHER_CANARY_APPROVAL_ID" != "unset"
+        test -n "$$ARCHER_CANARY_APPROVAL_ID"
+        target/release/archer-market-maker run --config "$$ARCHER_CANARY_CONFIG" --live
+    environment:
+      ARCHER_SERVICE_ROLE: canary-runner
+      ARCHER_RUN_MODE: canary
+      ARCHER_ENABLE_LIVE_TRADING: ${ARCHER_ENABLE_LIVE_TRADING:-false}
+      ARCHER_CANARY_PROFILE: ${ARCHER_CANARY_PROFILE:-unset}
+      ARCHER_CANARY_APPROVAL_ID: ${ARCHER_CANARY_APPROVAL_ID:-unset}
+      ARCHER_CANARY_CONFIG: ${ARCHER_CANARY_CONFIG:-config/canary/archer-sol-usdc-first-live.toml}
+      ARCHER_CANARY_ENVELOPE: ${ARCHER_CANARY_ENVELOPE:-config/canary/archer-sol-usdc-first-live-envelope.toml}
+    restart: "no"
+
+  archer-controller:
+    <<: *archer-common
+    profiles: ["controller"]
+    depends_on:
+      archer-dashboard:
+        condition: service_started
+    command:
+      - python3
+      - scripts/archer_adaptive_12h.py
+      - --run-id
+      - ${ARCHER_RUN_ID:-controller-dry-run}
+      - --duration-seconds
+      - ${ARCHER_DURATION_SECONDS:-900}
+      - --initial-profile
+      - ${ARCHER_INITIAL_PROFILE:-overnight_balanced_low_churn}
+    environment:
+      ARCHER_SERVICE_ROLE: controller
+      ARCHER_RUN_MODE: controller
+      ARCHER_ENABLE_LIVE_TRADING: "false"
+    restart: "no"
+
+  archer-emergency-clear:
+    <<: *archer-common
+    profiles: ["emergency-clear"]
+    command:
+      - python3
+      - scripts/archer_ops.py
+      - emergency-clear
+      - --run-id
+      - ${ARCHER_RUN_ID:-emergency-dry-run}
+    environment:
+      ARCHER_SERVICE_ROLE: emergency-clear
+      ARCHER_RUN_MODE: emergency-clear
+      ARCHER_ENABLE_LIVE_TRADING: ${ARCHER_ENABLE_LIVE_TRADING:-false}
+    restart: "no"

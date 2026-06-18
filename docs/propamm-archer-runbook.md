@@ -1,6 +1,6 @@
 # PropAMM Archer Runbook
 
-Last updated: 2026-05-19
+Last updated: 2026-06-18
 
 ## Scope
 
@@ -13,8 +13,14 @@ cancel/replace batch updates against a shared market account.
 
 - `execution.shadow_mode = true` in `config/default.toml`.
 - Live transaction submission requires `ARCHER_ENABLE_LIVE_TRADING=true`.
+- Operator wrappers in `scripts/archer_ops.py` default to dry-run JSON and write
+  retained audit artifacts under `logs/archer-ops/`.
 - `init`, `deposit`, `withdraw`, `kill`, `set-expiry`, and `run --live` are all
   blocked unless the live env gate is set.
+- The first live canary must also set
+  `ARCHER_CANARY_PROFILE=first-live-sol-usdc`,
+  `ARCHER_CANARY_APPROVAL_ID=<approved id>`, and pass
+  `config/canary/archer-sol-usdc-first-live-envelope.toml`.
 - Start with small funds while Archer audits are still in progress.
 - Priority fees default to dynamic account-local sampling with a `5000`
   microlamport/CU cap and a zero minimum, so the bot can send at 0 priority fee
@@ -25,6 +31,94 @@ cancel/replace batch updates against a shared market account.
   `u8tnfCb1JSSghuNFquQ2beStYgAN1kmd1f1Lhxbaec4`. The older
   `4G1A6nh...` account still decodes as a market, but live maker init rejected
   it during testing.
+
+## Service Topology
+
+The compose topology is defined in `deploy/docker-compose.archer.yml`.
+
+| Profile | Services | Live tx path | Role |
+|---------|----------|--------------|------|
+| `stopped` | `archer-dashboard` | no | Dashboard-only visibility with Archer intentionally stopped. |
+| `shadow` | `archer-dashboard`, `archer-shadow-runner` | no | Reads the same config path but forces `run --shadow`. |
+| `capped-live` | `archer-dashboard`, `archer-canary-runner` | gated | One-market live canary only after preflight, env, profile, and approval gates. |
+| `controller` | `archer-dashboard`, `archer-controller` | no by profile | Controller role retained separately from live runner. |
+| `emergency-clear` | `archer-emergency-clear` | dry-run unless explicitly confirmed | Clean-book orchestration and retained audit output. |
+
+`shadow` never sets `ARCHER_ENABLE_LIVE_TRADING=true`. `capped-live` exposes the
+live env gate but the operator wrapper refuses to plan it without
+`ARCHER_ENABLE_LIVE_TRADING=true`, `ARCHER_CANARY_PROFILE=first-live-sol-usdc`,
+and `ARCHER_CANARY_APPROVAL_ID`.
+
+## Operator Commands
+
+All commands below are local wrappers. Without `--execute`, they only print and
+audit the plan.
+
+```bash
+python3 scripts/archer_ops.py shadow-start --run-id archer-shadow-YYYYMMDD
+
+ARCHER_ENABLE_LIVE_TRADING=true \
+ARCHER_CANARY_PROFILE=first-live-sol-usdc \
+ARCHER_CANARY_APPROVAL_ID=<approved id> \
+python3 scripts/archer_ops.py canary-start \
+  --run-id archer-canary-YYYYMMDD \
+  --confirm-live-canary
+
+python3 scripts/archer_ops.py graceful-stop --run-id archer-stop-YYYYMMDD
+python3 scripts/archer_ops.py rollback-stopped --run-id archer-rollback-YYYYMMDD
+python3 scripts/archer_ops.py emergency-clear --run-id archer-clear-YYYYMMDD
+python3 scripts/archer_ops.py clean-book --run-id archer-clean-YYYYMMDD
+```
+
+Execution is intentionally separate:
+
+```bash
+python3 scripts/archer_ops.py shadow-start --run-id archer-shadow-YYYYMMDD --execute
+```
+
+Do not execute canary or emergency-clear commands unless the live gate and
+approval artifact have been reviewed. Emergency clear execution requires both
+`--execute` and `--confirm-emergency-clear`.
+
+## Preflight Gate
+
+Use the preflight gate before every shadow or canary start. It blocks missing or
+stale config, missing market-intel, wrong run mode, dirty MakerBook, missing
+rollback command, and missing canary envelope.
+
+```bash
+python3 scripts/archer_preflight_gate.py \
+  --metrics-url http://127.0.0.1:8787/api/metrics \
+  --expected-run-id <run id> \
+  --expected-mode shadow \
+  --config-file config/default.toml
+
+python3 scripts/archer_preflight_gate.py \
+  --metrics-url http://127.0.0.1:8787/api/metrics \
+  --expected-run-id <run id> \
+  --expected-mode canary \
+  --config-file config/canary/archer-sol-usdc-first-live.toml \
+  --canary-envelope-file config/canary/archer-sol-usdc-first-live-envelope.toml \
+  --rollback-command "scripts/archer_ops.py rollback-stopped" \
+  --require-canary-envelope
+```
+
+## First Live Canary Envelope
+
+The first live envelope is `SOL/USDC` only:
+
+- One market: `SOL/USDC`.
+- One level per side.
+- Max total quote notional: `20 USDC`, with `10 USDC` per level.
+- Isolated Archer hot wallet: no more than `0.30 WSOL`, `50 USDC`, and `0.05`
+  native SOL fee reserve.
+- Reserves: `75%` base and `75%` quote remain unquoted.
+- Transaction budget: at most `2` tx/minute and `2` update tx/10 minutes.
+- Runtime: maximum `30` minutes before stop and clean-book review.
+- Manifest coexistence: Manifest same-market `SOL/USDC` must be stopped before
+  the Archer canary; no internalization or self-quote mode is approved.
+- Rollback: `scripts/archer_ops.py rollback-stopped`, followed by retained
+  clean-book verification.
 
 ## First Checks
 

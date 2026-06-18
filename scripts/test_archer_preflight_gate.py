@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import argparse
+import os
+import tempfile
+import time
 from unittest import mock
 import unittest
 
@@ -32,6 +35,12 @@ def args(**overrides: object) -> argparse.Namespace:
         "require_clear_book": True,
         "require_owner_match": True,
         "require_market_intel": True,
+        "expected_mode": "",
+        "config_file": "",
+        "config_max_age_seconds": 0.0,
+        "canary_envelope_file": "",
+        "rollback_command": "",
+        "require_canary_envelope": False,
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -39,7 +48,7 @@ def args(**overrides: object) -> argparse.Namespace:
 
 def healthy_metrics() -> dict:
     return {
-        "run": {"run_id": "test-run"},
+        "run": {"run_id": "test-run", "mode": "shadow"},
         "market": {"command_ok": True, "owner_matches_archer": True},
         "status": {
             "command_ok": True,
@@ -97,6 +106,35 @@ class ArcherPreflightGateTests(unittest.TestCase):
         self.assertTrue(any("book is not clear" in failure for failure in failures))
         self.assertTrue(any("tightest effective spread" in failure for failure in failures))
         self.assertTrue(any("rpc_429" in failure for failure in failures))
+
+    def test_rejects_wrong_expected_mode(self) -> None:
+        failures = validate_metrics(healthy_metrics(), args(expected_mode="canary"))
+
+        self.assertTrue(any("run mode shadow != expected canary" in failure for failure in failures))
+
+    def test_rejects_missing_canary_envelope_and_rollback(self) -> None:
+        failures = validate_metrics(
+            healthy_metrics(),
+            args(expected_mode="canary", require_canary_envelope=True),
+        )
+
+        self.assertTrue(any("canary envelope is required" in failure for failure in failures))
+        self.assertTrue(any("rollback command is required" in failure for failure in failures))
+
+    def test_rejects_stale_config_file(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = os.path.join(tmp, "archer-canary.toml")
+            with open(config_path, "w", encoding="utf-8") as fh:
+                fh.write("[execution]\nshadow_mode = true\n")
+            stale_mtime = time.time() - 120.0
+            os.utime(config_path, (stale_mtime, stale_mtime))
+
+            failures = validate_metrics(
+                healthy_metrics(),
+                args(config_file=config_path, config_max_age_seconds=60.0),
+            )
+
+        self.assertTrue(any("config is stale" in failure for failure in failures))
 
     def test_waits_for_valid_metrics_after_partial_dashboard_snapshot(self) -> None:
         partial = healthy_metrics()

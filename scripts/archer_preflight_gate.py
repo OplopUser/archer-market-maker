@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 import time
 import socket
 import urllib.error
@@ -45,6 +46,153 @@ def load_metrics(args: argparse.Namespace) -> dict[str, Any]:
             time.sleep(args.retry_interval_seconds)
 
 
+def parse_scalar(value: str) -> Any:
+    value = value.strip()
+    if not value:
+        return ""
+    if value.startswith("[") and value.endswith("]"):
+        items = [item.strip() for item in value[1:-1].split(",") if item.strip()]
+        return [parse_scalar(item) for item in items]
+    if (value.startswith('"') and value.endswith('"')) or (
+        value.startswith("'") and value.endswith("'")
+    ):
+        return value[1:-1]
+    if value.lower() in {"true", "false"}:
+        return value.lower() == "true"
+    try:
+        if "." in value:
+            return float(value)
+        return int(value)
+    except ValueError:
+        return value
+
+
+def load_simple_toml(path: Path) -> dict[str, dict[str, Any]]:
+    data: dict[str, dict[str, Any]] = {}
+    section = ""
+    for raw_line in path.read_text(errors="replace").splitlines():
+        line = raw_line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip()
+            data.setdefault(section, {})
+            continue
+        key, sep, value = line.partition("=")
+        if sep != "=":
+            continue
+        data.setdefault(section, {})[key.strip()] = parse_scalar(value)
+    return data
+
+
+def validate_local_artifacts(metrics: dict[str, Any], args: argparse.Namespace) -> list[str]:
+    failures: list[str] = []
+
+    expected_mode = getattr(args, "expected_mode", "")
+    if expected_mode:
+        run = metrics.get("run", {})
+        actual_mode = run.get("mode") or metrics.get("mode")
+        if actual_mode != expected_mode:
+            failures.append(f"run mode {actual_mode} != expected {expected_mode}")
+
+    config_file = getattr(args, "config_file", "")
+    if config_file:
+        config_path = Path(config_file).expanduser()
+        if not config_path.exists():
+            failures.append(f"config file is missing: {config_path}")
+        else:
+            max_age = float(getattr(args, "config_max_age_seconds", 0.0) or 0.0)
+            if max_age > 0.0:
+                age = time.time() - config_path.stat().st_mtime
+                if age > max_age:
+                    failures.append(f"config is stale: age_seconds={age:.0f} > {max_age:.0f}")
+            try:
+                config = load_simple_toml(config_path)
+                shadow_mode = config.get("execution", {}).get("shadow_mode")
+                if expected_mode == "shadow" and shadow_mode is not True:
+                    failures.append("shadow mode requires execution.shadow_mode = true")
+                if expected_mode == "canary" and shadow_mode is True:
+                    failures.append("canary mode requires execution.shadow_mode = false")
+            except OSError as exc:
+                failures.append(f"config could not be read: {exc}")
+
+    rollback_command = getattr(args, "rollback_command", "")
+    needs_rollback = expected_mode == "canary" or bool(getattr(args, "require_canary_envelope", False))
+    if needs_rollback:
+        if not rollback_command:
+            failures.append("rollback command is required before Archer canary start")
+        else:
+            rollback_path = Path(str(rollback_command).split()[0]).expanduser()
+            if not rollback_path.exists():
+                failures.append(f"rollback command is missing: {rollback_path}")
+            elif not os.access(rollback_path, os.X_OK):
+                failures.append(f"rollback command is not executable: {rollback_path}")
+
+    envelope_file = getattr(args, "canary_envelope_file", "")
+    require_envelope = bool(getattr(args, "require_canary_envelope", False)) or expected_mode == "canary"
+    if require_envelope:
+        if not envelope_file:
+            failures.append("canary envelope is required before Archer canary start")
+        else:
+            envelope_path = Path(envelope_file).expanduser()
+            if not envelope_path.exists():
+                failures.append(f"canary envelope is missing: {envelope_path}")
+            else:
+                failures.extend(validate_canary_envelope(envelope_path, metrics, rollback_command))
+
+    return failures
+
+
+def validate_canary_envelope(
+    envelope_path: Path, metrics: dict[str, Any], rollback_command: str
+) -> list[str]:
+    failures: list[str] = []
+    try:
+        envelope = load_simple_toml(envelope_path)
+    except OSError as exc:
+        return [f"canary envelope could not be read: {exc}"]
+
+    canary = envelope.get("canary_envelope", {})
+    if canary.get("approved_profile") != "first-live-sol-usdc":
+        failures.append(f"canary envelope profile is not approved: {canary.get('approved_profile')}")
+    if canary.get("market") != "SOL/USDC":
+        failures.append(f"canary envelope market is not SOL/USDC: {canary.get('market')}")
+    if as_float(canary.get("max_levels_per_side"), 0.0) > 1.0:
+        failures.append("canary envelope allows more than one level per side")
+    if as_float(canary.get("max_total_quote_notional"), math.inf) > 25.0:
+        failures.append("canary envelope max_total_quote_notional is above tiny canary cap")
+    if as_float(canary.get("max_runtime_minutes"), math.inf) > 60.0:
+        failures.append("canary envelope runtime exceeds one-hour first-live cap")
+    if as_float(canary.get("max_tx_per_minute"), math.inf) > 2.0:
+        failures.append("canary envelope tx budget exceeds first-live cap")
+
+    coexistence = envelope.get("manifest_coexistence", {})
+    if coexistence.get("same_market_rule") not in {
+        "manifest_same_market_must_be_stopped",
+        "manifest_same_market_reduce_only_no_asks",
+    }:
+        failures.append("Manifest same-market coexistence rule is unresolved")
+
+    rollback = envelope.get("rollback", {})
+    envelope_rollback = str(rollback.get("command", ""))
+    if rollback_command and envelope_rollback and rollback_command not in envelope_rollback:
+        failures.append("rollback command does not match canary envelope")
+
+    status = metrics.get("status", {})
+    base_total = as_float(status.get("base_free"), 0.0) + as_float(status.get("base_locked"), 0.0)
+    quote_total = as_float(status.get("quote_free"), 0.0) + as_float(
+        status.get("quote_locked"), 0.0
+    )
+    max_wallet_base = as_float(canary.get("max_wallet_base"), math.inf)
+    max_wallet_quote = as_float(canary.get("max_wallet_quote"), math.inf)
+    if base_total > max_wallet_base:
+        failures.append(f"wallet base {base_total:.6f} exceeds canary envelope {max_wallet_base:.6f}")
+    if quote_total > max_wallet_quote:
+        failures.append(f"wallet quote {quote_total:.4f} exceeds canary envelope {max_wallet_quote:.4f}")
+
+    return failures
+
+
 def wait_for_valid_metrics(args: argparse.Namespace) -> tuple[dict[str, Any], list[str]]:
     """Wait until metrics are loaded and pass validation.
 
@@ -73,6 +221,7 @@ def wait_for_valid_metrics(args: argparse.Namespace) -> tuple[dict[str, Any], li
 
 def validate_metrics(metrics: dict[str, Any], args: argparse.Namespace) -> list[str]:
     failures: list[str] = []
+    failures.extend(validate_local_artifacts(metrics, args))
 
     run = metrics.get("run", {})
     if args.expected_run_id and run.get("run_id") != args.expected_run_id:
@@ -179,6 +328,11 @@ def main() -> None:
     parser.add_argument("--retry-interval-seconds", type=float, default=1.0)
     parser.add_argument("--timeout-seconds", type=float, default=8.0)
     parser.add_argument("--expected-run-id", default="")
+    parser.add_argument("--expected-mode", default="")
+    parser.add_argument("--config-file", default="")
+    parser.add_argument("--config-max-age-seconds", type=float, default=0.0)
+    parser.add_argument("--canary-envelope-file", default="")
+    parser.add_argument("--rollback-command", default="")
     parser.add_argument("--expected-profile", default="overnight_balanced_low_churn")
     parser.add_argument("--min-effective-spread-bps", type=float, default=62.0)
     parser.add_argument("--min-market-intel-spread-add-bps", type=float, default=0.0)
@@ -197,6 +351,7 @@ def main() -> None:
     parser.add_argument("--allow-live-book", action="store_true")
     parser.add_argument("--allow-market-owner-mismatch", action="store_true")
     parser.add_argument("--allow-missing-market-intel", action="store_true")
+    parser.add_argument("--require-canary-envelope", action="store_true")
     args = parser.parse_args()
     args.require_no_bot = not args.allow_running_bot
     args.require_no_controller = not args.allow_running_controller

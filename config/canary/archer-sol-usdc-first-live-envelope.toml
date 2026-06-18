@@ -1,0 +1,34 @@
+# Machine-checked first-live Archer canary envelope.
+
+[canary_envelope]
+approved_profile = "first-live-sol-usdc"
+market = "SOL/USDC"
+market_pubkey = "u8tnfCb1JSSghuNFquQ2beStYgAN1kmd1f1Lhxbaec4"
+max_levels_per_side = 1
+max_quote_notional_per_level = 10.0
+max_total_quote_notional = 20.0
+max_wallet_base = 0.30
+max_wallet_quote = 50.0
+min_base_reserve_pct = 75.0
+min_quote_reserve_pct = 75.0
+max_tx_per_minute = 2
+max_update_tx_per_10min = 2
+max_runtime_minutes = 30
+expiry_behavior = "stop_runner_then_clean_book"
+
+[manifest_coexistence]
+same_market_rule = "manifest_same_market_must_be_stopped"
+self_quote_rule = "no_internalization_without_explicit_followup_ticket"
+notes = "Do not run Archer SOL/USDC live while Manifest SOL/USDC is actively two-sided."
+
+[wallet_limits]
+wallet_role = "isolated_archer_hot_wallet"
+max_native_sol_fee_reserve = 0.05
+max_wsol = 0.30
+max_usdc = 50.0
+withdraw_surplus_before_start = true
+
+[rollback]
+command = "scripts/archer_ops.py rollback-stopped"
+requires_clean_book_verification = true
+requires_retained_artifact = true
