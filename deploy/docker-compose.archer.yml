@@ -74,6 +74,8 @@ services:
         test "$$ARCHER_CANARY_PROFILE" = "first-live-sol-usdc"
         test "$$ARCHER_CANARY_APPROVAL_ID" != "unset"
         test -n "$$ARCHER_CANARY_APPROVAL_ID"
+        test -n "$$ARCHER_CANARY_APPROVAL_ARTIFACT"
+        test -f "$$ARCHER_CANARY_APPROVAL_ARTIFACT"
         target/release/archer-market-maker run --config "$$ARCHER_CANARY_CONFIG" --live
     environment:
       ARCHER_SERVICE_ROLE: canary-runner
@@ -81,6 +83,7 @@ services:
       ARCHER_ENABLE_LIVE_TRADING: ${ARCHER_ENABLE_LIVE_TRADING:-false}
       ARCHER_CANARY_PROFILE: ${ARCHER_CANARY_PROFILE:-unset}
       ARCHER_CANARY_APPROVAL_ID: ${ARCHER_CANARY_APPROVAL_ID:-unset}
+      ARCHER_CANARY_APPROVAL_ARTIFACT: ${ARCHER_CANARY_APPROVAL_ARTIFACT:-config/canary/archer-sol-usdc-first-live-approval.toml}
       ARCHER_CANARY_CONFIG: ${ARCHER_CANARY_CONFIG:-config/canary/archer-sol-usdc-first-live.toml}
       ARCHER_CANARY_ENVELOPE: ${ARCHER_CANARY_ENVELOPE:-config/canary/archer-sol-usdc-first-live-envelope.toml}
     restart: "no"

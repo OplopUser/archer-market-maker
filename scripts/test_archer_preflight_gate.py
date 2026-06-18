@@ -20,6 +20,8 @@ def args(**overrides: object) -> argparse.Namespace:
         "expected_profile": "overnight_balanced_low_churn",
         "min_effective_spread_bps": 62.0,
         "min_market_intel_spread_add_bps": 0.0,
+        "min_market_intel_source_count": 2,
+        "min_market_intel_route_quality": 0.5,
         "min_base_free": 0.25,
         "min_quote_free": 25.0,
         "min_base_notional": 25.0,
@@ -40,6 +42,7 @@ def args(**overrides: object) -> argparse.Namespace:
         "config_file": "",
         "config_max_age_seconds": 0.0,
         "canary_envelope_file": "",
+        "canary_approval_artifact_file": "",
         "rollback_command": "",
         "require_canary_envelope": False,
         "static_only": False,
@@ -80,6 +83,8 @@ def healthy_metrics() -> dict:
             "url": "http://market-intel:8790/api/signals/sol_usdc",
             "fair_value": "80.1",
             "spread_add_bps": "12.0",
+            "source_count": 2,
+            "route_quality": {"score": 0.95, "status": "ok"},
         },
         "readiness": {
             "venue": "archer",
@@ -213,10 +218,13 @@ class ArcherPreflightGateTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             config_path = os.path.join(tmp, "archer-canary.toml")
             envelope_path = os.path.join(tmp, "envelope.toml")
+            approval_path = os.path.join(tmp, "approval.toml")
             rollback_path = os.path.join(tmp, "rollback")
             with open(rollback_path, "w", encoding="utf-8") as fh:
                 fh.write("#!/usr/bin/env sh\nexit 0\n")
             os.chmod(rollback_path, 0o755)
+            with open(approval_path, "w", encoding="utf-8") as fh:
+                fh.write("[approval]\nid = \"test-approval\"\n")
             with open(config_path, "w", encoding="utf-8") as fh:
                 fh.write(
                     """
@@ -279,6 +287,7 @@ command = "{rollback_path}"
                     expected_source_checksum="sha256:abc123",
                     expected_source_commit="deadbeef",
                     canary_envelope_file=envelope_path,
+                    canary_approval_artifact_file=approval_path,
                     rollback_command=rollback_path,
                     require_canary_envelope=True,
                     expected_run_id="",
@@ -326,10 +335,13 @@ command = "{rollback_path}"
     def test_canary_envelope_rejects_oversized_wallet_and_token_errors(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             envelope_path = os.path.join(tmp, "envelope.toml")
+            approval_path = os.path.join(tmp, "approval.toml")
             rollback_path = os.path.join(tmp, "rollback")
             with open(rollback_path, "w", encoding="utf-8") as fh:
                 fh.write("#!/usr/bin/env sh\nexit 0\n")
             os.chmod(rollback_path, 0o755)
+            with open(approval_path, "w", encoding="utf-8") as fh:
+                fh.write("[approval]\nid = \"test-approval\"\n")
             with open(envelope_path, "w", encoding="utf-8") as fh:
                 fh.write(
                     """
@@ -389,10 +401,13 @@ command = "rollback"
         with tempfile.TemporaryDirectory() as tmp:
             envelope_path = os.path.join(tmp, "envelope.toml")
             config_path = os.path.join(tmp, "archer-canary.toml")
+            approval_path = os.path.join(tmp, "approval.toml")
             rollback_path = os.path.join(tmp, "rollback")
             with open(rollback_path, "w", encoding="utf-8") as fh:
                 fh.write("#!/usr/bin/env sh\nexit 0\n")
             os.chmod(rollback_path, 0o755)
+            with open(approval_path, "w", encoding="utf-8") as fh:
+                fh.write("[approval]\nid = \"test-approval\"\n")
             with open(envelope_path, "w", encoding="utf-8") as fh:
                 fh.write(
                     """
@@ -453,6 +468,7 @@ max_update_tx_per_10min = 4
                     expected_mode="canary",
                     config_file=config_path,
                     canary_envelope_file=envelope_path,
+                    canary_approval_artifact_file=approval_path,
                     rollback_command=rollback_path,
                     require_canary_envelope=True,
                 ),
@@ -666,10 +682,13 @@ command = "{rollback_path}"
         with tempfile.TemporaryDirectory() as tmp:
             config_path = os.path.join(tmp, "archer-canary.toml")
             envelope_path = os.path.join(tmp, "envelope.toml")
+            approval_path = os.path.join(tmp, "approval.toml")
             rollback_path = os.path.join(tmp, "rollback")
             with open(rollback_path, "w", encoding="utf-8") as fh:
                 fh.write("#!/usr/bin/env sh\nexit 0\n")
             os.chmod(rollback_path, 0o755)
+            with open(approval_path, "w", encoding="utf-8") as fh:
+                fh.write("[approval]\nid = \"test-approval\"\n")
             with open(config_path, "w", encoding="utf-8") as fh:
                 fh.write(
                     """
@@ -758,6 +777,7 @@ command = "{rollback_path}"
                     expected_source_commit="deadbeef",
                     config_file=config_path,
                     canary_envelope_file=envelope_path,
+                    canary_approval_artifact_file=approval_path,
                     rollback_command=rollback_path,
                     require_canary_envelope=True,
                     min_base_free=0.0,
@@ -793,6 +813,128 @@ command = "{rollback_path}"
 
         self.assertIs(metrics, ready)
         self.assertEqual(failures, [])
+
+    def test_rejects_degraded_market_intel_route_quality_and_source_count(self) -> None:
+        metrics = healthy_metrics()
+        metrics["market_intel"]["source_count"] = 1
+        metrics["market_intel"]["route_quality"] = {"score": 0.20, "status": "degraded"}
+
+        failures = validate_metrics(metrics, args())
+
+        self.assertTrue(any("market-intel source_count" in failure for failure in failures))
+        self.assertTrue(any("market-intel route_quality" in failure for failure in failures))
+
+    def test_live_canary_requires_approval_artifact_before_placement(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = os.path.join(tmp, "archer-canary.toml")
+            envelope_path = os.path.join(tmp, "envelope.toml")
+            rollback_path = os.path.join(tmp, "rollback")
+            with open(rollback_path, "w", encoding="utf-8") as fh:
+                fh.write("#!/usr/bin/env sh\nexit 0\n")
+            os.chmod(rollback_path, 0o755)
+            with open(config_path, "w", encoding="utf-8") as fh:
+                fh.write(
+                    """
+[market]
+market_pubkey = "market-1"
+maker_keypair_path = "/tmp/archer.json"
+
+[strategy]
+spread_levels_bps = [80.0]
+
+[risk]
+max_quote_notional_per_level = 10.0
+max_total_quote_notional = 20.0
+min_base_reserve_pct = 75.0
+min_quote_reserve_pct = 75.0
+
+[execution]
+shadow_mode = false
+max_tx_per_minute = 2
+max_update_tx_per_10min = 2
+"""
+                )
+            with open(envelope_path, "w", encoding="utf-8") as fh:
+                fh.write(
+                    f"""
+[canary_envelope]
+approved_profile = "first-live-sol-usdc"
+market = "SOL/USDC"
+market_pubkey = "market-1"
+max_levels_per_side = 1
+max_quote_notional_per_level = 10.0
+max_total_quote_notional = 20.0
+max_wallet_base = 0.30
+max_wallet_quote = 50.0
+min_base_reserve_pct = 75.0
+min_quote_reserve_pct = 75.0
+max_tx_per_minute = 2
+max_update_tx_per_10min = 2
+max_runtime_minutes = 30
+
+[manifest_coexistence]
+same_market_rule = "manifest_same_market_must_be_stopped"
+
+[wallet_limits]
+max_native_sol_fee_reserve = 0.05
+max_wsol = 0.30
+max_usdc = 50.0
+
+[rollback]
+command = "{rollback_path}"
+"""
+                )
+
+            metrics = healthy_metrics()
+            metrics["run"]["mode"] = "canary"
+            metrics["strategy"]["active_profile"] = "first-live-sol-usdc"
+            metrics["strategy"]["min_effective_spread_bps"] = 80.0
+            metrics["strategy"]["effective_spreads_bps"] = [80.0]
+            metrics["source"] = {"checksum": "sha256:abc123", "commit": "deadbeef"}
+            metrics["supervisor"] = {
+                "expected_active": True,
+                "active": True,
+                "process_active": True,
+                "policy": {"ok": True},
+            }
+            metrics["wallet"] = {
+                "keypair_path": "/tmp/archer.json",
+                "balances": {"native_sol": 0.01, "wsol": 0.1, "usdc": 12.0, "errors": []},
+                "token_accounts": {
+                    "wsol": {"ready": True, "exists": True},
+                    "usdc": {"ready": True, "exists": True},
+                },
+            }
+
+            failures = validate_metrics(
+                metrics,
+                args(
+                    post_start=True,
+                    expected_mode="canary",
+                    expected_profile="first-live-sol-usdc",
+                    expected_source_checksum="sha256:abc123",
+                    expected_source_commit="deadbeef",
+                    config_file=config_path,
+                    canary_envelope_file=envelope_path,
+                    rollback_command=rollback_path,
+                    require_canary_envelope=True,
+                    min_base_free=0.0,
+                    min_quote_free=0.0,
+                    min_base_notional=0.0,
+                ),
+            )
+
+        self.assertTrue(any("approval artifact is required" in failure for failure in failures))
+
+    def test_compose_canary_profile_requires_approval_artifact(self) -> None:
+        compose = (
+            archer_preflight_gate.Path(__file__).resolve().parents[1]
+            / "deploy"
+            / "docker-compose.archer.yml"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn("ARCHER_CANARY_APPROVAL_ARTIFACT", compose)
+        self.assertIn("test -f \"$$ARCHER_CANARY_APPROVAL_ARTIFACT\"", compose)
 
 
 if __name__ == "__main__":
