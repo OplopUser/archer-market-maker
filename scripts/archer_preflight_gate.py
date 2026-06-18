@@ -513,9 +513,13 @@ def validate_metrics(metrics: dict[str, Any], args: argparse.Namespace) -> list[
         failures.append("status metrics are stale")
 
     process = metrics.get("process", {})
-    if args.require_no_bot and process.get("bot_running"):
+    expected_mode = expected_mode_from(args)
+    post_start = bool(getattr(args, "post_start", False))
+    expected_bot_runner = post_start and expected_mode in {"shadow", "canary"}
+    expected_controller_runner = post_start and expected_mode == "controller"
+    if args.require_no_bot and process.get("bot_running") and not expected_bot_runner:
         failures.append("Archer bot process is already running")
-    if args.require_no_controller and process.get("controller_running"):
+    if args.require_no_controller and process.get("controller_running") and not expected_controller_runner:
         failures.append("adaptive controller process is already running")
 
     bid_levels = as_float(status.get("bid_levels"), 0.0)
@@ -613,18 +617,18 @@ def validate_source(metrics: dict[str, Any], args: argparse.Namespace) -> list[s
 
 def validate_supervisor(metrics: dict[str, Any], args: argparse.Namespace) -> list[str]:
     supervisor = metrics.get("supervisor", {})
+    expected_mode = expected_mode_from(args)
+    post_start_active_mode = bool(getattr(args, "post_start", False)) and expected_mode in {
+        "shadow",
+        "canary",
+        "controller",
+    }
     if not isinstance(supervisor, dict):
-        if bool(getattr(args, "post_start", False)) and expected_mode_from(args) in {
-            "shadow",
-            "canary",
-        }:
+        if post_start_active_mode:
             return ["supervisor metrics are missing"]
         return []
     failures: list[str] = []
-    if bool(getattr(args, "post_start", False)) and expected_mode_from(args) in {
-        "shadow",
-        "canary",
-    } and not supervisor:
+    if post_start_active_mode and not supervisor:
         failures.append("supervisor metrics are missing")
         return failures
     if "expected_active" in supervisor:
@@ -632,18 +636,16 @@ def validate_supervisor(metrics: dict[str, Any], args: argparse.Namespace) -> li
         active = supervisor.get("active")
         if active is not expected_active:
             failures.append(f"supervisor active {active} != expected {expected_active}")
-    elif bool(getattr(args, "post_start", False)) and expected_mode_from(args) in {
-        "shadow",
-        "canary",
-    }:
+    elif post_start_active_mode:
         failures.append("supervisor active metrics are missing")
+    if post_start_active_mode and supervisor.get("expected_active") is True:
+        process_active = supervisor.get("process_active")
+        if process_active is not True:
+            failures.append(f"supervisor process active {process_active} != expected True")
 
     policy = supervisor.get("policy", {})
     if isinstance(policy, dict):
-        if bool(getattr(args, "post_start", False)) and expected_mode_from(args) in {
-            "shadow",
-            "canary",
-        } and not policy:
+        if post_start_active_mode and not policy:
             failures.append("supervisor policy metrics are missing")
         if policy.get("ok") is False:
             failures.append(f"supervisor policy is not ok: {policy.get('status')}")

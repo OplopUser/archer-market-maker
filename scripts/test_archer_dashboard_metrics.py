@@ -98,6 +98,23 @@ shadow_mode = true
         self.assertEqual(metrics["wallet"]["token_accounts"]["wsol"]["ready"], True)
         self.assertEqual(metrics["wallet"]["token_accounts"]["usdc"]["ready"], True)
 
+    def test_supervisor_active_requires_observed_runner_process(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "archer.toml"
+            config_path.write_text("[execution]\nshadow_mode = true\n", encoding="utf-8")
+
+            with mock.patch.dict(os.environ, {"ARCHER_RUN_MODE": "shadow"}, clear=False):
+                state = DashboardState(config_path, None, 30, 0, 0)
+
+                supervisor = state.supervisor_state(
+                    {"bot_running": False, "controller_running": False},
+                    {"commit": "deadbeef", "checksum": "sha256:abc123"},
+                )
+
+        self.assertEqual(supervisor["expected_active"], True)
+        self.assertEqual(supervisor["active"], False)
+        self.assertEqual(supervisor["process_active"], False)
+
 
 if __name__ == "__main__":
     unittest.main()

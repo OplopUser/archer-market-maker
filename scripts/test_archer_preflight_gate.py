@@ -485,6 +485,51 @@ shadow_mode = true
         self.assertTrue(any("source metrics are missing" in failure for failure in failures))
         self.assertTrue(any("supervisor metrics are missing" in failure for failure in failures))
 
+    def test_post_start_shadow_rejects_supervisor_active_without_runner_process(self) -> None:
+        metrics = healthy_metrics()
+        metrics["source"] = {"checksum": "sha256:abc123", "commit": "deadbeef"}
+        metrics["supervisor"] = {
+            "expected_active": True,
+            "active": True,
+            "process_active": False,
+            "policy": {"ok": True},
+        }
+
+        failures = validate_metrics(
+            metrics,
+            args(
+                post_start=True,
+                expected_mode="shadow",
+                expected_source_checksum="sha256:abc123",
+                expected_source_commit="deadbeef",
+            ),
+        )
+
+        self.assertTrue(any("supervisor process active" in failure for failure in failures))
+
+    def test_post_start_shadow_accepts_active_runner_process(self) -> None:
+        metrics = healthy_metrics()
+        metrics["process"]["bot_running"] = True
+        metrics["source"] = {"checksum": "sha256:abc123", "commit": "deadbeef"}
+        metrics["supervisor"] = {
+            "expected_active": True,
+            "active": True,
+            "process_active": True,
+            "policy": {"ok": True},
+        }
+
+        failures = validate_metrics(
+            metrics,
+            args(
+                post_start=True,
+                expected_mode="shadow",
+                expected_source_checksum="sha256:abc123",
+                expected_source_commit="deadbeef",
+            ),
+        )
+
+        self.assertEqual(failures, [])
+
     def test_canary_requires_wallet_readiness_fields(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_path = os.path.join(tmp, "archer-canary.toml")
@@ -649,8 +694,14 @@ command = "{rollback_path}"
             metrics["strategy"]["effective_spreads_bps"] = [80.0]
             metrics["status"]["base_free"] = 0.1
             metrics["status"]["quote_free"] = 12.0
+            metrics["process"]["bot_running"] = True
             metrics["source"] = {"checksum": "sha256:abc123", "commit": "deadbeef"}
-            metrics["supervisor"] = {"expected_active": True, "active": True, "policy": {"ok": True}}
+            metrics["supervisor"] = {
+                "expected_active": True,
+                "active": True,
+                "process_active": True,
+                "policy": {"ok": True},
+            }
             metrics["wallet"] = {
                 "pubkey": "maker",
                 "keypair_path": "/tmp/archer.json",

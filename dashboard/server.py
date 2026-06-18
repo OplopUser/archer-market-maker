@@ -577,10 +577,13 @@ class DashboardState:
     def supervisor_state(self, process: Dict[str, Any], source: Dict[str, Any]) -> Dict[str, Any]:
         mode = os.environ.get("ARCHER_RUN_MODE") or "stopped"
         expected_active = mode in {"shadow", "canary", "controller"}
+        process_active = bool(
+            process.get("controller_running") if mode == "controller" else process.get("bot_running")
+        )
         if mode == "controller":
-            active = bool(process.get("controller_running"))
+            active = process_active
         elif mode in {"shadow", "canary"}:
-            active = expected_active
+            active = process_active
         else:
             active = False
         policy_ok = bool(source.get("commit") and source.get("checksum"))
@@ -590,9 +593,7 @@ class DashboardState:
             "mode": mode,
             "expected_active": expected_active,
             "active": active,
-            "process_active": bool(
-                process.get("controller_running") if mode == "controller" else process.get("bot_running")
-            ),
+            "process_active": process_active,
             "policy": {
                 "ok": policy_ok,
                 "status": "ok" if policy_ok else "missing_source_identity",
