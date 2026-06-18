@@ -86,6 +86,13 @@ def _reason_codes(metrics: Dict[str, Any], clean_book_actions: Any) -> list[str]
     return codes
 
 
+def _first_dict(*values: Any) -> Dict[str, Any]:
+    for value in values:
+        if isinstance(value, dict):
+            return value
+    return {}
+
+
 def build_capture_event(
     metrics: Dict[str, Any],
     *,
@@ -107,6 +114,7 @@ def build_capture_event(
     strategy = metrics.get("strategy", {}) if isinstance(metrics.get("strategy"), dict) else {}
     clean_book_actions = metrics.get("clean_book_actions") or []
     event_policy_version = _policy_version(metrics, policy_version)
+    market_intel = metrics.get("market_intel", {}) if isinstance(metrics.get("market_intel"), dict) else {}
 
     tx_summary = {
         "ok": transactions.get("ok"),
@@ -150,8 +158,28 @@ def build_capture_event(
         "source": source_metadata(source),
         "policy_version": event_policy_version,
         "reason_codes": _reason_codes(metrics, clean_book_actions),
+        "config_checksum": metrics.get("config_checksum"),
+        "static_config": _first_dict(metrics.get("static_config"), strategy.get("static_config")),
+        "signal_multipliers": _first_dict(
+            metrics.get("signal_multipliers"),
+            strategy.get("signal_multipliers"),
+        ),
+        "quote_policy_control": _first_dict(
+            metrics.get("quote_policy_control"),
+            strategy.get("quote_policy_control"),
+        ),
+        "route_quality": _first_dict(metrics.get("route_quality"), market_intel.get("route_quality")),
+        "quote_decision": _first_dict(metrics.get("quote_decision"), strategy.get("quote_decision")),
+        "no_fill_exposure": _first_dict(
+            metrics.get("no_fill_exposure"),
+            strategy.get("no_fill_exposure"),
+        ),
+        "expected_fill": _first_dict(metrics.get("expected_fill"), strategy.get("expected_fill")),
+        "expected_edge": _first_dict(metrics.get("expected_edge"), strategy.get("expected_edge")),
+        "portfolio_exposure": _first_dict(metrics.get("portfolio_exposure")),
+        "promotion_inputs": _first_dict(metrics.get("promotion_inputs"), strategy.get("promotion_inputs")),
         "dashboard_metrics": metrics,
-        "market_intel_snapshot": metrics.get("market_intel", {}),
+        "market_intel_snapshot": market_intel,
         "makerbook_readback": makerbook_status,
         "makerbook_status": makerbook_status,
         "tx_summary": tx_summary,

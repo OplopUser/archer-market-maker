@@ -123,6 +123,54 @@ class ArcherShadowReviewTests(unittest.TestCase):
             self.assertEqual(review["status"], "fail")
             self.assertIn("simulated_update_policy_violation", review["reason_codes"])
 
+    def test_replay_report_includes_policy_route_exposure_edge_and_promotion_gate(self) -> None:
+        events = [
+            capture_event(
+                config_checksum="sha256:fixture-config",
+                static_config={"status": "pass", "checksum": "sha256:fixture-config"},
+                signal_multipliers={"status": "pass", "spread_multiplier": 1.0, "size_multiplier": 0.8},
+                quote_policy_control={"status": "pass", "version": "policy-fixture"},
+                route_quality={"score": 0.91, "best_route": "archer_direct"},
+                no_fill_exposure={"bid_notional": 55.0, "ask_notional": 40.0},
+                expected_fill={"probability": 0.22},
+                expected_edge={"bps": 3.6},
+                promotion_inputs={
+                    "shadow_passed": True,
+                    "live_canary_passed": False,
+                    "after_cost_edge_bps": 1.4,
+                    "min_after_cost_edge_bps": 1.0,
+                    "cross_venue_safe": True,
+                    "requested_capital_usdc": 500.0,
+                    "approved_capital_usdc": 1000.0,
+                },
+            )
+        ]
+
+        review = archer_shadow_review.evaluate_shadow_events(
+            events,
+            policy={
+                "version": "policy-fixture",
+                "min_route_quality_score": 0.80,
+                "max_no_fill_quote_notional": 125.0,
+                "min_expected_edge_bps": 1.0,
+                "max_failed_tx": 0,
+            },
+            observation_seconds=60,
+        )
+
+        self.assertEqual(review["config_checksum"], "sha256:fixture-config")
+        self.assertEqual(review["control_validation"]["static_config"]["status"], "pass")
+        self.assertEqual(review["control_validation"]["signal_multipliers"]["status"], "pass")
+        self.assertEqual(review["control_validation"]["quote_policy"]["status"], "pass")
+        self.assertEqual(review["route_quality"]["status"], "pass")
+        self.assertEqual(review["route_quality"]["min_score"], 0.91)
+        self.assertEqual(review["no_fill_exposure"]["max_quote_notional"], 95.0)
+        self.assertEqual(review["expected_fill_edge"]["avg_expected_fill_probability"], 0.22)
+        self.assertEqual(review["expected_fill_edge"]["avg_expected_edge_bps"], 3.6)
+        self.assertEqual(review["blockers"], ["live_canary_not_passed"])
+        self.assertFalse(review["promotion_gate"]["live_canary_passed"])
+        self.assertFalse(review["promotion_gate"]["multi_venue_allowed"])
+
     def test_url_observation_polls_until_fixed_window_expires(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             with mock.patch.object(archer_shadow_review, "capture_once") as capture_once:
