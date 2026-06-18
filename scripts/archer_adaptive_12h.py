@@ -30,6 +30,7 @@ from dashboard.server import DashboardState, iso, load_simple_toml, pubkey_from_
 
 BIN = ROOT / "target" / "release" / "archer-market-maker"
 SOURCE_CONFIG = ROOT / "config" / "live-usdc-style-12h.toml"
+FALLBACK_SOURCE_CONFIG = ROOT / "config" / "default.toml"
 ACTIVE_CONFIG = ROOT / "config" / "adaptive-live.toml"
 CONTROLLER_SCREEN = "archer-adaptive-12h"
 ACTIVE_SCREEN = "archer-adaptive-active"
@@ -321,7 +322,8 @@ class AdaptiveController:
         self.active_strategy_json = self.run_dir / "active-strategy.json"
         self.commands_log = self.run_dir / "commands.log"
         self.bot_log = self.run_dir / "bot.log"
-        self.config_base = load_simple_toml(SOURCE_CONFIG)
+        source_config = SOURCE_CONFIG if SOURCE_CONFIG.exists() else FALLBACK_SOURCE_CONFIG
+        self.config_base = load_simple_toml(source_config)
         maker_keypair_path = os.environ.get("ARCHER_MAKER_KEYPAIR_PATH")
         if maker_keypair_path:
             self.config_base.setdefault("market", {})["maker_keypair_path"] = maker_keypair_path
