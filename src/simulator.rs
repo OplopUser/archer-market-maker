@@ -1,5 +1,6 @@
 use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::archer::{
     accounts::{active_ask_levels, active_bid_levels, maker_balances},
@@ -9,6 +10,11 @@ use crate::archer::{
 };
 use crate::quote_policy::{PolicyMode, QuotePolicy, SidePolicy};
 use solana_sdk::pubkey::Pubkey;
+
+const EXPECTED_MARKET_PAIR: &str = "SOL/USDC";
+const SUPPORTED_MARKET_INTEL_VERSION: &str = "archer.quote_policy.v1";
+const MIN_MARKET_INTEL_SOURCES: usize = 2;
+const MIN_ROUTE_QUALITY_SCORE: f64 = 0.50;
 
 #[derive(Debug, Clone)]
 pub struct SimulationInput {
@@ -151,6 +157,17 @@ pub struct SimulationOutput {
     pub min_spread_bps: f64,
     pub max_spread_bps: f64,
     pub stale_hold_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)]
+pub struct MarketIntelPolicySignal {
+    pub quote_policy: QuotePolicy,
+    pub raw_signal: Value,
+    pub version: String,
+    pub source_count: usize,
+    pub route_quality_score: f64,
+    pub quote_permission: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -440,22 +457,76 @@ pub fn current_maker_book_state(
     }
 }
 
-pub fn quote_policy_from_market_intel_json(value: serde_json::Value) -> Result<QuotePolicy> {
+pub fn market_intel_signal_from_json(value: Value) -> Result<MarketIntelPolicySignal> {
+    let policy_value = market_intel_policy_value(&value)?;
+    let quote_policy = serde_json::from_value::<QuotePolicy>(policy_value.clone())
+        .context("market-intel quote_policy is malformed")?;
+    let mut validation_failures = Vec::new();
+    let version = value
+        .get("version")
+        .and_then(Value::as_str)
+        .context("market-intel response missing version")?
+        .to_string();
+    if version != SUPPORTED_MARKET_INTEL_VERSION {
+        validation_failures.push(format!(
+            "unsupported market-intel policy version: {version}"
+        ));
+    }
+    if let Err(err) = ensure_market_pair(
+        market_pair_from_signal(&value)
+            .or_else(|| Some(quote_policy.market_pair.as_str()))
+            .unwrap_or(""),
+    ) {
+        validation_failures.push(err.to_string());
+    }
+
+    let quote_permission = value
+        .pointer("/quote_permission/quote_enabled")
+        .or_else(|| value.pointer("/recommendation/quote_enabled"))
+        .and_then(Value::as_bool)
+        .context("market-intel response missing quote_permission.quote_enabled")?;
+    if !quote_permission {
+        validation_failures.push("market-intel quote permission is disabled".to_string());
+    }
+
+    let source_count = source_count_from_signal(&value);
+    if source_count < MIN_MARKET_INTEL_SOURCES {
+        validation_failures.push(format!(
+            "market-intel source_count {source_count} below required {MIN_MARKET_INTEL_SOURCES}"
+        ));
+    }
+
+    let route_quality_score = route_quality_from_signal(&value)
+        .context("market-intel response missing route_quality score")?;
+    if route_quality_score < MIN_ROUTE_QUALITY_SCORE {
+        validation_failures.push(format!(
+            "market-intel route_quality {route_quality_score:.2} below required {MIN_ROUTE_QUALITY_SCORE:.2}"
+        ));
+    }
+    ensure!(
+        validation_failures.is_empty(),
+        "market-intel signal rejected: {}",
+        validation_failures.join("; ")
+    );
+
+    Ok(MarketIntelPolicySignal {
+        quote_policy,
+        raw_signal: value,
+        version,
+        source_count,
+        route_quality_score,
+        quote_permission,
+    })
+}
+
+pub fn quote_policy_from_market_intel_json(value: Value) -> Result<QuotePolicy> {
+    if looks_like_market_intel_signal(&value) {
+        return market_intel_signal_from_json(value).map(|signal| signal.quote_policy);
+    }
+
     serde_json::from_value::<QuotePolicy>(value.clone())
         .or_else(|_| {
-            value
-                .get("quote_policy")
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("market-intel response missing quote_policy"))
-                .and_then(|value| serde_json::from_value::<QuotePolicy>(value).map_err(Into::into))
-        })
-        .or_else(|_| {
-            value
-                .pointer("/recommendation/quote_policy")
-                .cloned()
-                .ok_or_else(|| {
-                    anyhow::anyhow!("market-intel response missing recommendation.quote_policy")
-                })
+            market_intel_policy_value(&value)
                 .and_then(|value| serde_json::from_value::<QuotePolicy>(value).map_err(Into::into))
         })
         .context("market-intel response did not contain a quote policy")
@@ -593,6 +664,12 @@ fn validate_state_and_config(state: &CurrentState, config: &SimulatorConfig) -> 
 
 fn fail_closed_reasons(input: &SimulationInput) -> Vec<String> {
     let mut reasons = Vec::new();
+    if !input.config.offline_preview && input.policy.market_pair != EXPECTED_MARKET_PAIR {
+        reasons.push(format!(
+            "quote_policy_wrong_market:{}",
+            input.policy.market_pair
+        ));
+    }
     if !input.policy.quote_enabled {
         reasons.push("quote_policy_disabled".to_string());
     }
@@ -612,6 +689,56 @@ fn fail_closed_reasons(input: &SimulationInput) -> Vec<String> {
         }
     }
     reasons
+}
+
+fn market_intel_policy_value(value: &Value) -> Result<Value> {
+    value
+        .get("quote_policy")
+        .cloned()
+        .or_else(|| value.pointer("/recommendation/quote_policy").cloned())
+        .ok_or_else(|| anyhow::anyhow!("market-intel response missing quote_policy"))
+}
+
+fn looks_like_market_intel_signal(value: &Value) -> bool {
+    value.get("version").is_some()
+        || value.get("sources").is_some()
+        || value.get("route_quality").is_some()
+        || value.get("quote_permission").is_some()
+}
+
+fn ensure_market_pair(pair: &str) -> Result<()> {
+    ensure!(
+        pair == EXPECTED_MARKET_PAIR,
+        "market-intel market_pair {pair} != expected {EXPECTED_MARKET_PAIR}"
+    );
+    Ok(())
+}
+
+fn market_pair_from_signal(value: &Value) -> Option<&str> {
+    value
+        .get("market_pair")
+        .and_then(Value::as_str)
+        .or_else(|| value.pointer("/market/pair").and_then(Value::as_str))
+}
+
+fn source_count_from_signal(value: &Value) -> usize {
+    value
+        .get("source_count")
+        .and_then(Value::as_u64)
+        .map(|count| count as usize)
+        .or_else(|| value.get("sources").and_then(Value::as_array).map(Vec::len))
+        .unwrap_or(0)
+}
+
+fn route_quality_from_signal(value: &Value) -> Option<f64> {
+    match value.get("route_quality") {
+        Some(Value::Number(number)) => number.as_f64(),
+        Some(Value::Object(_)) => value
+            .pointer("/route_quality/score")
+            .and_then(Value::as_f64),
+        _ => None,
+    }
+    .filter(|score| score.is_finite())
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1337,5 +1464,78 @@ mod tests {
         assert!(output.applied_update.bid_levels.is_empty());
         assert!(output.applied_update.ask_levels.is_empty());
         assert!(!output.live_transactions_enabled);
+    }
+
+    #[test]
+    fn simulator_fails_closed_for_wrong_market_and_unsupported_policy_signal() {
+        let mut wrong_market = policy();
+        wrong_market.market_pair = "ETH/USDC".to_string();
+        let wrong_market = simulate_quote_policy(SimulationInput {
+            policy: wrong_market,
+            state: CurrentState {
+                mid_price: 100.0,
+                cached_mid_ticks: 0,
+                base_available: 10.0,
+                quote_available: 1_000.0,
+                maker_book: None,
+                wallet: None,
+            },
+            market_config: market_config(),
+            config: SimulatorConfig {
+                now_ms: Some(1_500),
+                offline_preview: false,
+                ..SimulatorConfig::default()
+            },
+        })
+        .expect("wrong market should return closed diagnostics");
+        assert_eq!(
+            wrong_market.reject_reasons,
+            vec!["quote_policy_wrong_market:ETH/USDC".to_string()]
+        );
+        assert_eq!(wrong_market.action, SimulatedAction::Hold);
+        assert!(wrong_market.applied_update.bid_levels.is_empty());
+
+        let signal = serde_json::json!({
+            "version": "archer.quote_policy.v0",
+            "market_pair": "SOL/USDC",
+            "market": {"pair": "SOL/USDC"},
+            "quote_permission": {"quote_enabled": true},
+            "sources": [
+                {"name": "manifest", "mid": 100.0},
+                {"name": "binance", "mid": 100.1}
+            ],
+            "route_quality": {"score": 0.95, "status": "ok"},
+            "quote_policy": policy()
+        });
+
+        let err = quote_policy_from_market_intel_json(signal)
+            .expect_err("unsupported market-intel policy versions must fail closed");
+        assert!(err.to_string().contains("unsupported"));
+    }
+
+    #[test]
+    fn market_intel_parser_requires_source_count_route_quality_and_preserves_raw_signal() {
+        let raw = serde_json::json!({
+            "version": "archer.quote_policy.v1",
+            "market_pair": "SOL/USDC",
+            "market": {"pair": "SOL/USDC"},
+            "quote_permission": {"quote_enabled": true},
+            "sources": [
+                {"name": "manifest", "mid": 100.0}
+            ],
+            "route_quality": {"score": 0.25, "status": "degraded"},
+            "quote_policy": policy()
+        });
+
+        let err = quote_policy_from_market_intel_json(raw.clone())
+            .expect_err("degraded one-source signal must fail closed");
+        let message = err.to_string();
+        assert!(message.contains("source_count"));
+        assert!(message.contains("route_quality"));
+        assert_eq!(
+            raw.pointer("/quote_policy/market_pair")
+                .and_then(serde_json::Value::as_str),
+            Some("SOL/USDC")
+        );
     }
 }

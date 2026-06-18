@@ -207,6 +207,17 @@ def validate_local_artifacts(metrics: dict[str, Any], args: argparse.Namespace) 
                     )
                 )
 
+    approval_artifact = getattr(args, "canary_approval_artifact_file", "") or os.environ.get(
+        "ARCHER_CANARY_APPROVAL_ARTIFACT", ""
+    )
+    if expected_mode == "canary":
+        if not approval_artifact:
+            failures.append("canary approval artifact is required before Archer live placement")
+        else:
+            approval_path = Path(approval_artifact).expanduser()
+            if not approval_path.exists():
+                failures.append(f"canary approval artifact is missing: {approval_path}")
+
     return failures
 
 
@@ -580,6 +591,18 @@ def validate_metrics(metrics: dict[str, Any], args: argparse.Namespace) -> list[
             failures.append(
                 f"market-intel spread_add {spread_add:.2f}bps < {args.min_market_intel_spread_add_bps:.2f}bps"
             )
+        source_count = market_intel_source_count(market_intel)
+        min_source_count = int(getattr(args, "min_market_intel_source_count", 2))
+        if source_count < min_source_count:
+            failures.append(
+                f"market-intel source_count {source_count} < {min_source_count}"
+            )
+        route_quality = market_intel_route_quality(market_intel)
+        min_route_quality = as_float(getattr(args, "min_market_intel_route_quality", 0.5), 0.5)
+        if not math.isfinite(route_quality) or route_quality < min_route_quality:
+            failures.append(
+                f"market-intel route_quality {route_quality:.2f} < {min_route_quality:.2f}"
+            )
 
     logs = metrics.get("logs", {}).get("counts", {})
     limits = {
@@ -595,6 +618,28 @@ def validate_metrics(metrics: dict[str, Any], args: argparse.Namespace) -> list[
             failures.append(f"{key} count {value:.0f} > {limit:.0f}")
 
     return failures
+
+
+def market_intel_source_count(market_intel: dict[str, Any]) -> int:
+    raw_count = market_intel.get("source_count")
+    if raw_count is not None:
+        try:
+            return int(raw_count)
+        except (TypeError, ValueError):
+            return 0
+    sources = market_intel.get("sources")
+    if isinstance(sources, list):
+        return len(sources)
+    if isinstance(sources, dict):
+        return len(sources)
+    return 0
+
+
+def market_intel_route_quality(market_intel: dict[str, Any]) -> float:
+    raw_quality = market_intel.get("route_quality")
+    if isinstance(raw_quality, dict):
+        return as_float(raw_quality.get("score"))
+    return as_float(raw_quality)
 
 
 def validate_source(metrics: dict[str, Any], args: argparse.Namespace) -> list[str]:
@@ -680,6 +725,8 @@ def main() -> None:
     parser.add_argument("--expected-profile", default="overnight_balanced_low_churn")
     parser.add_argument("--min-effective-spread-bps", type=float, default=62.0)
     parser.add_argument("--min-market-intel-spread-add-bps", type=float, default=0.0)
+    parser.add_argument("--min-market-intel-source-count", type=int, default=2)
+    parser.add_argument("--min-market-intel-route-quality", type=float, default=0.5)
     parser.add_argument("--min-base-free", type=float, default=0.25)
     parser.add_argument("--min-quote-free", type=float, default=25.0)
     parser.add_argument("--min-base-notional", type=float, default=25.0)
@@ -696,6 +743,7 @@ def main() -> None:
     parser.add_argument("--allow-market-owner-mismatch", action="store_true")
     parser.add_argument("--allow-missing-market-intel", action="store_true")
     parser.add_argument("--require-canary-envelope", action="store_true")
+    parser.add_argument("--canary-approval-artifact-file", default="")
     parser.add_argument("--allow-missing-source", action="store_true")
     args = parser.parse_args()
     args.require_no_bot = not args.allow_running_bot
