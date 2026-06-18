@@ -107,7 +107,7 @@ market_pubkey = "YOUR_MARKET_PUBKEY"
 maker_keypair_path = "~/.config/solana/id.json"
 
 [connection]
-rpc_url = "https://mainnet.helius-rpc.com?api-key=YOUR_KEY"
+rpc_url = "https://mainnet.helius-rpc.com"
 
 [feed]
 binance_symbol = "SOLUSDT"
