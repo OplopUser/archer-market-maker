@@ -1,10 +1,11 @@
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use serde::{Deserialize, Serialize};
 
 use crate::archer::{
+    accounts::{active_ask_levels, active_bid_levels, maker_balances},
     config::MarketConfig,
     math::{BookUpdate, Quote, TwoSidedQuote, base_lots_to_amount, build_book_update},
-    types::{MARKET_STATE_DISCRIMINATOR, MAX_LEVELS, MarketStateHeader},
+    types::{MARKET_STATE_DISCRIMINATOR, MAX_LEVELS, MakerBook, MarketStateHeader},
 };
 use crate::quote_policy::{PolicyMode, QuotePolicy, SidePolicy};
 use solana_sdk::pubkey::Pubkey;
@@ -47,13 +48,42 @@ pub struct MarketConfigFixture {
     pub quote_decimals: u8,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CurrentState {
     pub mid_price: f64,
     #[serde(default)]
     pub cached_mid_ticks: u64,
     pub base_available: f64,
     pub quote_available: f64,
+    #[serde(default)]
+    pub maker_book: Option<CurrentMakerBookState>,
+    #[serde(default)]
+    pub wallet: Option<WalletBalanceContext>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct CurrentMakerBookState {
+    pub sequence_number: u64,
+    pub mid_price_ticks: u64,
+    pub active_bid_levels: usize,
+    pub active_ask_levels: usize,
+    pub base_free: f64,
+    pub base_locked: f64,
+    pub quote_free: f64,
+    pub quote_locked: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WalletBalanceContext {
+    pub source: String,
+    #[serde(default)]
+    pub native_sol: Option<f64>,
+    #[serde(default)]
+    pub base: Option<f64>,
+    #[serde(default)]
+    pub quote: Option<f64>,
+    #[serde(default)]
+    pub errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -103,7 +133,9 @@ impl Default for SimulatorConfig {
 #[derive(Debug, Clone, Serialize)]
 pub struct SimulationOutput {
     pub desired_policy: QuotePolicy,
+    pub action: SimulatedAction,
     pub applied_update: AppliedBookUpdate,
+    pub current_state: CurrentState,
     pub capped_fields: Vec<String>,
     pub reject_reasons: Vec<String>,
     pub bid_levels: Vec<PreviewLevel>,
@@ -119,6 +151,23 @@ pub struct SimulationOutput {
     pub min_spread_bps: f64,
     pub max_spread_bps: f64,
     pub stale_hold_ms: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SimulatedAction {
+    UpdateBook,
+    ClearBook,
+    Hold,
+}
+
+#[derive(Debug, Clone)]
+pub struct LiveDryRunSnapshot {
+    pub policy: Option<QuotePolicy>,
+    pub read_errors: Vec<String>,
+    pub current_state: CurrentState,
+    pub market_config: MarketConfig,
+    pub config: SimulatorConfig,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -169,6 +218,7 @@ pub fn simulate_quote_policy(input: SimulationInput) -> Result<SimulationOutput>
     if !reject_reasons.is_empty() {
         return Ok(output(
             input.policy,
+            input.state.clone(),
             empty_update(
                 input.state.mid_price,
                 input.state.cached_mid_ticks,
@@ -265,6 +315,7 @@ pub fn simulate_quote_policy(input: SimulationInput) -> Result<SimulationOutput>
 
     Ok(output(
         input.policy,
+        input.state.clone(),
         applied_update,
         bids,
         asks,
@@ -309,6 +360,7 @@ pub fn simulate_fixture(fixture: SimulationFixture) -> Result<SimulationOutput> 
             };
             Ok(output(
                 policy,
+                fixture.state.clone(),
                 empty_update(
                     fixture.state.mid_price,
                     fixture.state.cached_mid_ticks,
@@ -325,8 +377,129 @@ pub fn simulate_fixture(fixture: SimulationFixture) -> Result<SimulationOutput> 
     }
 }
 
+pub fn simulate_live_dry_run_snapshot(snapshot: LiveDryRunSnapshot) -> Result<SimulationOutput> {
+    let LiveDryRunSnapshot {
+        policy,
+        read_errors,
+        current_state,
+        market_config,
+        config,
+    } = snapshot;
+    match policy {
+        Some(policy) if read_errors.is_empty() => simulate_quote_policy(SimulationInput {
+            policy,
+            state: current_state,
+            market_config,
+            config,
+        }),
+        maybe_policy => {
+            validate_state_and_config(&current_state, &config)?;
+            let policy = maybe_policy.unwrap_or_else(missing_policy);
+            let mut reject_reasons = read_errors;
+            if !reject_reasons
+                .iter()
+                .any(|reason| reason == "quote_policy_missing")
+                && !policy.quote_enabled
+                && policy.reason_codes.iter().any(|reason| reason == "missing")
+            {
+                reject_reasons.push("quote_policy_missing".to_string());
+            }
+            Ok(output(
+                policy,
+                current_state.clone(),
+                empty_update(
+                    current_state.mid_price,
+                    current_state.cached_mid_ticks,
+                    &market_config,
+                ),
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                reject_reasons,
+                PolicyMode::Shadow,
+                &config,
+            ))
+        }
+    }
+}
+
+pub fn current_maker_book_state(
+    book: &MakerBook,
+    market_config: &MarketConfig,
+) -> CurrentMakerBookState {
+    let balances = maker_balances(book, market_config);
+    CurrentMakerBookState {
+        sequence_number: book.last_updated_sequence_number,
+        mid_price_ticks: book.mid_price_ticks,
+        active_bid_levels: active_bid_levels(book),
+        active_ask_levels: active_ask_levels(book),
+        base_free: balances.base_free,
+        base_locked: balances.base_locked,
+        quote_free: balances.quote_free,
+        quote_locked: balances.quote_locked,
+    }
+}
+
+pub fn quote_policy_from_market_intel_json(value: serde_json::Value) -> Result<QuotePolicy> {
+    serde_json::from_value::<QuotePolicy>(value.clone())
+        .or_else(|_| {
+            value
+                .get("quote_policy")
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("market-intel response missing quote_policy"))
+                .and_then(|value| serde_json::from_value::<QuotePolicy>(value).map_err(Into::into))
+        })
+        .or_else(|_| {
+            value
+                .pointer("/recommendation/quote_policy")
+                .cloned()
+                .ok_or_else(|| {
+                    anyhow::anyhow!("market-intel response missing recommendation.quote_policy")
+                })
+                .and_then(|value| serde_json::from_value::<QuotePolicy>(value).map_err(Into::into))
+        })
+        .context("market-intel response did not contain a quote policy")
+}
+
+pub fn mid_price_from_market_intel_json(value: &serde_json::Value) -> Option<f64> {
+    [
+        "/recommendation/fair_value",
+        "/reference/price",
+        "/sources/manifest/mid",
+        "/sources/binance/mid",
+        "/sources/hyperliquid/mid",
+    ]
+    .iter()
+    .find_map(|path| value.pointer(path).and_then(serde_json::Value::as_f64))
+    .filter(|price| price.is_finite() && *price > 0.0)
+}
+
+fn missing_policy() -> QuotePolicy {
+    QuotePolicy {
+        market_pair: "unknown".to_string(),
+        quote_enabled: false,
+        mode: PolicyMode::Shadow,
+        level_count: 0,
+        bid: SidePolicy {
+            enabled: false,
+            spreads_bps: Vec::new(),
+            level_sizes_base: Vec::new(),
+            size_multiplier: 0.0,
+        },
+        ask: SidePolicy {
+            enabled: false,
+            spreads_bps: Vec::new(),
+            level_sizes_base: Vec::new(),
+            size_multiplier: 0.0,
+        },
+        reason_codes: vec!["missing".to_string()],
+        timestamp_ms: None,
+        max_age_ms: None,
+    }
+}
+
 impl MarketConfigFixture {
-    fn to_market_config(&self) -> Result<MarketConfig> {
+    pub fn to_market_config(&self) -> Result<MarketConfig> {
         let market_pubkey = parse_fixture_pubkey(&self.market_pubkey, 1)?;
         let header = MarketStateHeader {
             discriminator: MARKET_STATE_DISCRIMINATOR,
@@ -379,37 +552,40 @@ fn fixed_pubkey(tag: u8) -> Pubkey {
 }
 
 fn validate_input(input: &SimulationInput) -> Result<()> {
+    validate_state_and_config(&input.state, &input.config)
+}
+
+fn validate_state_and_config(state: &CurrentState, config: &SimulatorConfig) -> Result<()> {
     ensure!(
-        input.state.mid_price.is_finite() && input.state.mid_price > 0.0,
+        state.mid_price.is_finite() && state.mid_price > 0.0,
         "mid_price must be positive"
     );
     ensure!(
-        input.state.base_available.is_finite() && input.state.base_available >= 0.0,
+        state.base_available.is_finite() && state.base_available >= 0.0,
         "base_available must be >= 0"
     );
     ensure!(
-        input.state.quote_available.is_finite() && input.state.quote_available >= 0.0,
+        state.quote_available.is_finite() && state.quote_available >= 0.0,
         "quote_available must be >= 0"
     );
     ensure!(
-        input.config.max_total_quote_notional.is_finite()
-            && input.config.max_total_quote_notional >= 0.0,
+        config.max_total_quote_notional.is_finite() && config.max_total_quote_notional >= 0.0,
         "max_total_quote_notional must be >= 0"
     );
     ensure!(
-        input.config.max_quote_notional_per_level.is_finite()
-            && input.config.max_quote_notional_per_level >= 0.0,
+        config.max_quote_notional_per_level.is_finite()
+            && config.max_quote_notional_per_level >= 0.0,
         "max_quote_notional_per_level must be >= 0"
     );
     ensure!(
-        input.config.min_quote_notional.is_finite() && input.config.min_quote_notional >= 0.0,
+        config.min_quote_notional.is_finite() && config.min_quote_notional >= 0.0,
         "min_quote_notional must be >= 0"
     );
     ensure!(
-        input.config.min_spread_bps.is_finite()
-            && input.config.max_spread_bps.is_finite()
-            && input.config.min_spread_bps >= 0.0
-            && input.config.max_spread_bps >= input.config.min_spread_bps,
+        config.min_spread_bps.is_finite()
+            && config.max_spread_bps.is_finite()
+            && config.min_spread_bps >= 0.0
+            && config.max_spread_bps >= config.min_spread_bps,
         "spread bounds must be finite and ordered"
     );
     Ok(())
@@ -605,6 +781,7 @@ fn align_preview_to_update(
 
 fn output(
     desired_policy: QuotePolicy,
+    current_state: CurrentState,
     applied_update: AppliedBookUpdate,
     bid_levels: Vec<PreviewLevel>,
     ask_levels: Vec<PreviewLevel>,
@@ -618,9 +795,12 @@ fn output(
         .chain(ask_levels.iter())
         .map(|level| level.notional)
         .sum::<f64>();
+    let action = simulated_action(&applied_update, &reject_reasons, &current_state);
     SimulationOutput {
         desired_policy,
+        action,
         applied_update,
+        current_state,
         capped_fields,
         reject_reasons,
         bid_levels,
@@ -643,6 +823,27 @@ fn output(
         min_spread_bps: config.min_spread_bps,
         max_spread_bps: config.max_spread_bps,
         stale_hold_ms: config.stale_hold_ms,
+    }
+}
+
+fn simulated_action(
+    applied_update: &AppliedBookUpdate,
+    reject_reasons: &[String],
+    current_state: &CurrentState,
+) -> SimulatedAction {
+    if reject_reasons.is_empty()
+        && (applied_update.num_bid_levels > 0 || applied_update.num_ask_levels > 0)
+    {
+        return SimulatedAction::UpdateBook;
+    }
+    if current_state
+        .maker_book
+        .map(|book| book.active_bid_levels > 0 || book.active_ask_levels > 0)
+        .unwrap_or(false)
+    {
+        SimulatedAction::ClearBook
+    } else {
+        SimulatedAction::Hold
     }
 }
 
@@ -759,6 +960,8 @@ mod tests {
                 cached_mid_ticks: 0,
                 base_available: 10.0,
                 quote_available: 1_000.0,
+                maker_book: None,
+                wallet: None,
             },
             market_config: market_config(),
             config: SimulatorConfig {
@@ -807,6 +1010,8 @@ mod tests {
                 cached_mid_ticks: 0,
                 base_available: 10.0,
                 quote_available: 1_000.0,
+                maker_book: None,
+                wallet: None,
             },
             market_config: market_config(),
             config: SimulatorConfig {
@@ -828,6 +1033,7 @@ mod tests {
         assert!(stale.applied_update.bid_levels.is_empty());
         assert!(stale.applied_update.ask_levels.is_empty());
         assert_eq!(stale.reject_reasons, vec!["quote_policy_stale".to_string()]);
+        assert_eq!(stale.action, SimulatedAction::Hold);
 
         let mut disabled = policy();
         disabled.quote_enabled = false;
@@ -851,6 +1057,17 @@ mod tests {
                 cached_mid_ticks: 0,
                 base_available: 10.0,
                 quote_available: 1_000.0,
+                maker_book: Some(CurrentMakerBookState {
+                    sequence_number: 42,
+                    mid_price_ticks: 100_000,
+                    active_bid_levels: 1,
+                    active_ask_levels: 1,
+                    base_free: 8.0,
+                    base_locked: 2.0,
+                    quote_free: 900.0,
+                    quote_locked: 100.0,
+                }),
+                wallet: None,
             },
             market_config: market_config(),
         })
@@ -860,6 +1077,180 @@ mod tests {
             vec!["quote_policy_disabled".to_string()]
         );
         assert!(disabled.applied_update.bid_levels.is_empty());
+        assert_eq!(disabled.action, SimulatedAction::ClearBook);
+        assert_eq!(
+            disabled.current_state.maker_book.unwrap().sequence_number,
+            42
+        );
+    }
+
+    #[test]
+    fn simulator_outputs_current_state_wallet_context_and_clear_book_action() {
+        let mut disabled_policy = policy();
+        disabled_policy.quote_enabled = false;
+        let output = simulate_quote_policy(SimulationInput {
+            policy: disabled_policy,
+            state: CurrentState {
+                mid_price: 100.0,
+                cached_mid_ticks: 77_000,
+                base_available: 4.0,
+                quote_available: 500.0,
+                maker_book: Some(CurrentMakerBookState {
+                    sequence_number: 99,
+                    mid_price_ticks: 77_000,
+                    active_bid_levels: 2,
+                    active_ask_levels: 0,
+                    base_free: 3.5,
+                    base_locked: 0.5,
+                    quote_free: 450.0,
+                    quote_locked: 50.0,
+                }),
+                wallet: Some(WalletBalanceContext {
+                    source: "rpc_token_accounts".to_string(),
+                    native_sol: Some(0.2),
+                    base: Some(1.25),
+                    quote: Some(42.0),
+                    errors: vec!["quote token account unavailable".to_string()],
+                }),
+            },
+            market_config: market_config(),
+            config: SimulatorConfig {
+                now_ms: Some(1_500),
+                offline_preview: false,
+                local_max_levels: 16,
+                max_total_quote_notional: 250.0,
+                max_quote_notional_per_level: 80.0,
+                min_quote_notional: 5.0,
+                min_spread_bps: 10.0,
+                max_spread_bps: 100.0,
+                min_base_reserve: 1.0,
+                min_quote_reserve: 100.0,
+                stale_hold_ms: 10_000,
+            },
+        })
+        .expect("disabled live state returns closed output");
+
+        assert_eq!(output.action, SimulatedAction::ClearBook);
+        assert_eq!(
+            output
+                .current_state
+                .maker_book
+                .as_ref()
+                .unwrap()
+                .sequence_number,
+            99
+        );
+        assert_eq!(
+            output.current_state.wallet.as_ref().unwrap().source,
+            "rpc_token_accounts"
+        );
+        assert_eq!(
+            output.current_state.wallet.as_ref().unwrap().errors,
+            vec!["quote token account unavailable".to_string()]
+        );
+    }
+
+    #[test]
+    fn live_dry_run_snapshot_builds_input_without_network_clients() {
+        let snapshot = LiveDryRunSnapshot {
+            policy: Some(policy()),
+            read_errors: Vec::new(),
+            current_state: CurrentState {
+                mid_price: 100.0,
+                cached_mid_ticks: 88_000,
+                base_available: 6.0,
+                quote_available: 700.0,
+                maker_book: Some(CurrentMakerBookState {
+                    sequence_number: 7,
+                    mid_price_ticks: 88_000,
+                    active_bid_levels: 1,
+                    active_ask_levels: 1,
+                    base_free: 5.0,
+                    base_locked: 1.0,
+                    quote_free: 650.0,
+                    quote_locked: 50.0,
+                }),
+                wallet: Some(WalletBalanceContext {
+                    source: "rpc_token_accounts".to_string(),
+                    native_sol: Some(0.3),
+                    base: Some(2.0),
+                    quote: Some(20.0),
+                    errors: Vec::new(),
+                }),
+            },
+            market_config: market_config(),
+            config: SimulatorConfig {
+                now_ms: Some(5_000),
+                offline_preview: false,
+                ..SimulatorConfig::default()
+            },
+        };
+
+        let output = simulate_live_dry_run_snapshot(snapshot).expect("snapshot should simulate");
+
+        assert_eq!(output.action, SimulatedAction::UpdateBook);
+        assert!(!output.live_transactions_enabled);
+        assert_eq!(
+            output
+                .current_state
+                .maker_book
+                .as_ref()
+                .unwrap()
+                .sequence_number,
+            7
+        );
+        assert_eq!(
+            output.current_state.wallet.as_ref().unwrap().source,
+            "rpc_token_accounts"
+        );
+    }
+
+    #[test]
+    fn live_dry_run_read_errors_fail_closed_without_transactions() {
+        let snapshot = LiveDryRunSnapshot {
+            policy: None,
+            read_errors: vec![
+                "market_intel_signal_url missing".to_string(),
+                "maker_book_read: rpc unavailable".to_string(),
+            ],
+            current_state: CurrentState {
+                mid_price: 100.0,
+                cached_mid_ticks: 0,
+                base_available: 0.0,
+                quote_available: 0.0,
+                maker_book: None,
+                wallet: Some(WalletBalanceContext {
+                    source: "rpc_token_accounts".to_string(),
+                    native_sol: None,
+                    base: None,
+                    quote: None,
+                    errors: vec!["wallet balance read failed".to_string()],
+                }),
+            },
+            market_config: market_config(),
+            config: SimulatorConfig {
+                now_ms: Some(5_000),
+                offline_preview: false,
+                ..SimulatorConfig::default()
+            },
+        };
+
+        let output = simulate_live_dry_run_snapshot(snapshot).expect("read errors return JSON");
+
+        assert_eq!(output.action, SimulatedAction::Hold);
+        assert!(!output.live_transactions_enabled);
+        assert_eq!(
+            output.reject_reasons,
+            vec![
+                "market_intel_signal_url missing".to_string(),
+                "maker_book_read: rpc unavailable".to_string(),
+                "quote_policy_missing".to_string()
+            ]
+        );
+        assert_eq!(
+            output.current_state.wallet.unwrap().errors,
+            vec!["wallet balance read failed".to_string()]
+        );
     }
 
     #[test]
@@ -879,6 +1270,8 @@ mod tests {
                 cached_mid_ticks: 0,
                 base_available: 10.0,
                 quote_available: 60.0,
+                maker_book: None,
+                wallet: None,
             },
             market_config: market_config(),
             config: SimulatorConfig {
