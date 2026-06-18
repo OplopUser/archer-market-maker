@@ -2,6 +2,8 @@ mod archer;
 mod config;
 mod engine;
 mod feed;
+mod quote_policy;
+mod simulator;
 mod state;
 mod strategy;
 mod tx;
@@ -28,6 +30,11 @@ use solana_sdk::signer::Signer;
 use tokio_util::sync::CancellationToken;
 
 use crate::config::{Cli, load_config, resolve_path};
+use crate::simulator::{
+    CurrentState, LiveDryRunSnapshot, MarketConfigFixture, SimulationFixture, SimulatorConfig,
+    WalletBalanceContext, current_maker_book_state, mid_price_from_market_intel_json,
+    quote_policy_from_market_intel_json, simulate_fixture, simulate_live_dry_run_snapshot,
+};
 use crate::state::SharedState;
 use crate::strategy::{IntelAdjustments, QuoteDecision, Strategy};
 use crate::tx::{TxPriority, TxSender};
@@ -105,6 +112,11 @@ async fn main() -> Result<()> {
             )
             .await
         }
+        Cli::SimulatePolicy {
+            fixture,
+            config,
+            dry_run_live,
+        } => cmd_simulate_policy(fixture.as_deref(), &config, dry_run_live).await,
         Cli::Init { config } => cmd_init(&config).await,
         Cli::Deposit {
             config,
@@ -116,6 +128,243 @@ async fn main() -> Result<()> {
         Cli::Status { config } => cmd_status(&config).await,
         Cli::SetExpiry { config, slots } => cmd_set_expiry(&config, slots).await,
     }
+}
+
+async fn cmd_simulate_policy(
+    fixture_path: Option<&std::path::Path>,
+    config_path: &std::path::Path,
+    dry_run_live: bool,
+) -> Result<()> {
+    let output = if dry_run_live {
+        simulate_policy_live_dry_run(config_path).await?
+    } else {
+        let fixture_path = fixture_path
+            .context("simulate-policy requires --fixture unless --dry-run-live is set")?;
+        let contents = std::fs::read_to_string(fixture_path)
+            .with_context(|| format!("reading {}", fixture_path.display()))?;
+        let fixture: SimulationFixture = serde_json::from_str(&contents)
+            .with_context(|| format!("parsing {}", fixture_path.display()))?;
+        simulate_fixture(fixture)?
+    };
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
+async fn simulate_policy_live_dry_run(
+    config_path: &std::path::Path,
+) -> Result<crate::simulator::SimulationOutput> {
+    let mm_config = load_config(config_path)?;
+    let market_pubkey: Pubkey = mm_config
+        .market
+        .market_pubkey
+        .parse()
+        .context("Invalid market_pubkey")?;
+    let mut read_errors = Vec::new();
+    let maker_pubkey = match load_keypair(&mm_config.market.maker_keypair_path) {
+        Ok(keypair) => keypair.pubkey(),
+        Err(e) => {
+            read_errors.push(format!("maker_keypair_read: {e:#}"));
+            Pubkey::default()
+        }
+    };
+    let maker_pubkey_available = maker_pubkey != Pubkey::default();
+    let archer_client = ArcherClient::new(&mm_config.connection.rpc_url);
+
+    let signal_result =
+        fetch_market_intel_quote_policy(&mm_config.feed.market_intel_signal_url).await;
+    let (policy, signal_mid_price) = match signal_result {
+        Ok(value) => {
+            let mid_price = mid_price_from_market_intel_json(&value);
+            match quote_policy_from_market_intel_json(value) {
+                Ok(policy) => (Some(policy), mid_price),
+                Err(e) => {
+                    read_errors.push(format!("market_intel_quote_policy_read: {e:#}"));
+                    (None, mid_price)
+                }
+            }
+        }
+        Err(e) => {
+            read_errors.push(format!("market_intel_signal_read: {e:#}"));
+            (None, None)
+        }
+    };
+
+    let market_config = match archer_client.get_market_config(&market_pubkey).await {
+        Ok(config) => config,
+        Err(e) => {
+            read_errors.push(format!("market_config_read: {e:#}"));
+            fallback_market_config(market_pubkey)?
+        }
+    };
+
+    let mut maker_book_context = None;
+    let mut mid_price = signal_mid_price.unwrap_or(0.0);
+    let mut cached_mid_ticks = 0;
+    let mut base_available = 0.0;
+    let mut quote_available = 0.0;
+    if maker_pubkey_available {
+        match archer_client
+            .get_maker_book(&market_pubkey, &maker_pubkey)
+            .await
+        {
+            Ok(book) => {
+                let maker_state = current_maker_book_state(&book, &market_config);
+                let balances = maker_balances(&book, &market_config);
+                if mid_price <= 0.0 && book.mid_price_ticks > 0 {
+                    mid_price = book.mid_price_ticks as f64 * market_config.ticks_to_price_factor();
+                }
+                cached_mid_ticks = book.mid_price_ticks;
+                base_available = balances.base_total;
+                quote_available = balances.quote_total;
+                maker_book_context = Some(maker_state);
+            }
+            Err(e) => read_errors.push(format!("maker_book_read: {e:#}")),
+        }
+    } else {
+        read_errors.push("maker_book_read: maker pubkey unavailable".to_string());
+    }
+
+    if mid_price <= 0.0 {
+        mid_price = 1.0;
+        read_errors.push("mid_price_unavailable".to_string());
+    }
+
+    let wallet = if maker_pubkey_available {
+        wallet_balance_context(&mm_config, &market_config, &maker_pubkey).await
+    } else {
+        WalletBalanceContext {
+            source: "rpc_token_accounts".to_string(),
+            native_sol: None,
+            base: None,
+            quote: None,
+            errors: vec!["maker pubkey unavailable".to_string()],
+        }
+    };
+    let config = simulator_config_from_mm(&mm_config, base_available, quote_available);
+    let current_state = CurrentState {
+        mid_price,
+        cached_mid_ticks,
+        base_available,
+        quote_available,
+        maker_book: maker_book_context,
+        wallet: Some(wallet),
+    };
+
+    simulate_live_dry_run_snapshot(LiveDryRunSnapshot {
+        policy,
+        read_errors,
+        current_state,
+        market_config,
+        config,
+    })
+}
+
+async fn fetch_market_intel_quote_policy(
+    configured_url: &Option<String>,
+) -> Result<serde_json::Value> {
+    let url = configured_url
+        .as_deref()
+        .filter(|url| !url.trim().is_empty())
+        .context("market_intel_signal_url missing")?;
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(3))
+        .build()
+        .context("building market-intel HTTP client")?;
+    client
+        .get(url)
+        .send()
+        .await
+        .with_context(|| format!("GET {url}"))?
+        .error_for_status()
+        .with_context(|| format!("GET {url} returned error status"))?
+        .json::<serde_json::Value>()
+        .await
+        .with_context(|| format!("decoding JSON from {url}"))
+}
+
+fn simulator_config_from_mm(
+    mm_config: &crate::config::MMConfig,
+    base_available: f64,
+    quote_available: f64,
+) -> SimulatorConfig {
+    SimulatorConfig {
+        now_ms: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_millis() as u64),
+        offline_preview: false,
+        local_max_levels: mm_config.strategy.spread_levels_bps.len(),
+        max_total_quote_notional: mm_config.risk.max_total_quote_notional,
+        max_quote_notional_per_level: mm_config.risk.max_quote_notional_per_level,
+        min_quote_notional: mm_config.risk.min_quote_notional,
+        min_spread_bps: mm_config.strategy.min_effective_spread_bps,
+        max_spread_bps: mm_config
+            .strategy
+            .spread_levels_bps
+            .iter()
+            .copied()
+            .fold(mm_config.strategy.min_effective_spread_bps, f64::max)
+            + mm_config.strategy.max_intel_spread_add_bps
+            + mm_config.strategy.max_intel_side_spread_add_bps,
+        min_base_reserve: base_available * mm_config.risk.min_base_reserve_pct / 100.0,
+        min_quote_reserve: quote_available * mm_config.risk.min_quote_reserve_pct / 100.0,
+        stale_hold_ms: mm_config.feed.staleness_timeout_ms,
+    }
+}
+
+async fn wallet_balance_context(
+    mm_config: &crate::config::MMConfig,
+    market_config: &crate::archer::config::MarketConfig,
+    maker_pubkey: &Pubkey,
+) -> WalletBalanceContext {
+    let rpc = RpcClient::new(mm_config.connection.rpc_url.clone());
+    let mut context = WalletBalanceContext {
+        source: "rpc_token_accounts".to_string(),
+        native_sol: None,
+        base: None,
+        quote: None,
+        errors: Vec::new(),
+    };
+    match rpc.get_balance(maker_pubkey).await {
+        Ok(lamports) => context.native_sol = Some(lamports as f64 / 1_000_000_000.0),
+        Err(e) => context.errors.push(format!("native_sol: {e:#}")),
+    }
+    let base_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
+        maker_pubkey,
+        &market_config.base_mint,
+        &market_config.base_token_program,
+    );
+    let quote_ata = spl_associated_token_account::get_associated_token_address_with_program_id(
+        maker_pubkey,
+        &market_config.quote_mint,
+        &market_config.quote_token_program,
+    );
+    match rpc.get_token_account_balance(&base_ata).await {
+        Ok(amount) => context.base = amount.ui_amount,
+        Err(e) => context.errors.push(format!("base_token: {e:#}")),
+    }
+    match rpc.get_token_account_balance(&quote_ata).await {
+        Ok(amount) => context.quote = amount.ui_amount,
+        Err(e) => context.errors.push(format!("quote_token: {e:#}")),
+    }
+    context
+}
+
+fn fallback_market_config(market_pubkey: Pubkey) -> Result<crate::archer::config::MarketConfig> {
+    MarketConfigFixture {
+        market_pubkey: Some(market_pubkey.to_string()),
+        base_mint: None,
+        quote_mint: None,
+        base_atoms_per_base_lot: 1_000_000,
+        quote_atoms_per_quote_lot: 1_000,
+        tick_size_in_quote_atoms_per_base_unit: 10_000,
+        raw_base_units_per_base_unit: 1_000_000_000,
+        maker_fee_ppm: 0,
+        taker_fee_ppm: 0,
+        base_decimals: 9,
+        quote_decimals: 6,
+    }
+    .to_market_config()
 }
 
 async fn cmd_run(config_path: &std::path::Path, shadow: bool, live: bool) -> Result<()> {
