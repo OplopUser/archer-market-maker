@@ -4,7 +4,6 @@ use super::config::MarketConfig;
 use super::math::{base_lots_to_amount, quote_lots_to_amount};
 use super::types::{MakerBook, MarketStateHeader};
 
-
 #[derive(Debug, Clone, Copy)]
 pub struct MakerBalances {
     pub base_free: f64,
@@ -15,11 +14,9 @@ pub struct MakerBalances {
     pub quote_total: f64,
 }
 
-
 pub fn parse_market_state(data: &[u8]) -> Result<&MarketStateHeader> {
     MarketStateHeader::load(data)
 }
-
 
 pub fn maker_balances(book: &MakerBook, config: &MarketConfig) -> MakerBalances {
     let base_free = base_lots_to_amount(book.base_free, config);
@@ -35,7 +32,6 @@ pub fn maker_balances(book: &MakerBook, config: &MarketConfig) -> MakerBalances 
         quote_total: quote_free + quote_locked,
     }
 }
-
 
 pub fn active_bid_levels(book: &MakerBook) -> usize {
     book.bid_levels

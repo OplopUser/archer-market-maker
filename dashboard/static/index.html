@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Archer Bot Dashboard</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <header class="topbar">
+        <div>
+          <p class="eyebrow">Archer live monitor</p>
+          <h1>SOL/USDC adaptive run</h1>
+        </div>
+        <div class="status-stack">
+          <span id="runState" class="state-pill">Loading</span>
+          <span id="lastUpdated" class="muted">Waiting for data</span>
+        </div>
+      </header>
+
+      <section class="progress-band">
+        <div>
+          <span class="label">Run progress</span>
+          <strong id="runWindow">--</strong>
+        </div>
+        <div class="progress-track" aria-label="run progress">
+          <span id="progressBar"></span>
+        </div>
+      </section>
+
+      <section class="kpi-grid">
+        <article class="metric emphasis">
+          <span class="label">Net trading vs hold</span>
+          <strong id="netTrading">--</strong>
+          <small id="netTradingNote">After estimated tx fees</small>
+        </article>
+        <article class="metric">
+          <span class="label">Trading vs hold</span>
+          <strong id="tradingPnl">--</strong>
+          <small id="tradingPnlNote">Excludes SOL market drift</small>
+        </article>
+        <article class="metric">
+          <span class="label">Fee spend</span>
+          <strong id="feeSpend">--</strong>
+          <small id="feeCoverage">--</small>
+        </article>
+        <article class="metric">
+          <span class="label">Mid price</span>
+          <strong id="midPrice">--</strong>
+          <small id="midTicks">--</small>
+        </article>
+        <article class="metric">
+          <span class="label">Active quotes</span>
+          <strong id="activeQuotes">--</strong>
+          <small id="lockedNotional">--</small>
+        </article>
+        <article class="metric">
+          <span class="label">Transactions</span>
+          <strong id="txCount">--</strong>
+          <small id="txFailures">--</small>
+        </article>
+      </section>
+
+      <section class="main-grid">
+        <article class="panel wide">
+          <div class="panel-head">
+            <div>
+              <h2>PnL Over Time</h2>
+              <p>Marked against the starting MakerBook inventory.</p>
+            </div>
+          </div>
+          <canvas id="pnlChart" width="900" height="300"></canvas>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>Inventory</h2>
+              <p>MakerBook plus wallet balances.</p>
+            </div>
+          </div>
+          <div class="table-list" id="inventoryList"></div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>Health</h2>
+              <p>Process, feed, and transaction signals.</p>
+            </div>
+          </div>
+          <div class="health-list" id="healthList"></div>
+        </article>
+
+        <article class="panel wide">
+          <div class="panel-head">
+            <div>
+              <h2>Fees And Activity</h2>
+              <p>Known transaction fee total since run start.</p>
+            </div>
+          </div>
+          <canvas id="feeChart" width="900" height="240"></canvas>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>Strategy</h2>
+              <p>Live config summary.</p>
+            </div>
+          </div>
+          <div class="table-list" id="strategyList"></div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>Strategy Ledger</h2>
+              <p>Adaptive decisions and profile changes.</p>
+            </div>
+          </div>
+          <div class="tx-list" id="ledgerList"></div>
+        </article>
+
+        <article class="panel">
+          <div class="panel-head">
+            <div>
+              <h2>Recent Transactions</h2>
+              <p>Most recent wallet signatures in this run.</p>
+            </div>
+          </div>
+          <div class="tx-list" id="txList"></div>
+        </article>
+      </section>
+
+      <section class="panel full">
+        <div class="panel-head">
+          <div>
+            <h2>Run Log</h2>
+            <p>Controller summary tail.</p>
+          </div>
+        </div>
+        <pre id="logTail" class="log-box">Loading...</pre>
+      </section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>

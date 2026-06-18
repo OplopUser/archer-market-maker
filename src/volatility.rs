@@ -100,7 +100,9 @@ mod tests {
     #[test]
     fn known_volatility() {
         let mut t = VolatilityTracker::new(10);
-        let prices = [100.0, 101.0, 99.5, 100.5, 102.0, 101.0, 100.0, 99.0, 100.0, 101.0];
+        let prices = [
+            100.0, 101.0, 99.5, 100.5, 102.0, 101.0, 100.0, 99.0, 100.0, 101.0,
+        ];
         for p in &prices {
             t.push(*p);
         }

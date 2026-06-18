@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use futures_util::{SinkExt, StreamExt};
 use serde::Deserialize;
+use serde_json::Value;
 use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
@@ -30,17 +31,206 @@ fn parse_binance_book_ticker(txt: &str) -> Option<(String, f64, f64)> {
     }
 }
 
-fn handle_tick(
-    state: &SharedState,
-    vol_tracker: &mut VolatilityTracker,
-    bid: f64,
-    ask: f64,
-) {
+fn handle_tick(state: &SharedState, vol_tracker: &mut VolatilityTracker, bid: f64, ask: f64) {
     let mid = (bid + ask) * 0.5;
     state.mid_price.store(mid, Relaxed);
     state.price_timestamp_us.store(now_us(), Relaxed);
     vol_tracker.push(mid);
-    state.volatility_bps.store(vol_tracker.realized_vol_bps(), Relaxed);
+    state
+        .volatility_bps
+        .store(vol_tracker.realized_vol_bps(), Relaxed);
+}
+
+fn value_as_finite_f64(value: &Value) -> Option<f64> {
+    let parsed = match value {
+        Value::Number(number) => number.as_f64(),
+        Value::String(text) => text.parse::<f64>().ok(),
+        _ => None,
+    }?;
+    parsed.is_finite().then_some(parsed)
+}
+
+fn json_finite_f64_at(value: &Value, path: &str) -> Option<f64> {
+    value.pointer(path).and_then(value_as_finite_f64)
+}
+
+fn json_positive_f64_at(value: &Value, path: &str) -> Option<f64> {
+    json_finite_f64_at(value, path).filter(|value| *value > 0.0)
+}
+
+fn json_bool_at(value: &Value, path: &str) -> Option<bool> {
+    value.pointer(path).and_then(Value::as_bool)
+}
+
+fn json_str_at<'a>(value: &'a Value, path: &str) -> Option<&'a str> {
+    value.pointer(path).and_then(Value::as_str)
+}
+
+fn bounded_multiplier(value: Option<f64>, fallback: f64) -> f64 {
+    value
+        .filter(|v| v.is_finite())
+        .unwrap_or(fallback)
+        .clamp(0.0, 1.0)
+}
+
+fn market_intel_price(signal: &Value) -> Option<f64> {
+    [
+        "/recommendation/fair_value",
+        "/reference/price",
+        "/sources/manifest/mid",
+        "/sources/binance/mid",
+        "/sources/hyperliquid/mid",
+    ]
+    .iter()
+    .find_map(|path| json_positive_f64_at(signal, path))
+}
+
+async fn run_market_intel_feed(
+    state: Arc<SharedState>,
+    url: String,
+    poll_ms: u64,
+    vol_window: usize,
+    cancel: CancellationToken,
+) {
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(3))
+        .build()
+    {
+        Ok(client) => client,
+        Err(e) => {
+            tracing::error!("market-intel HTTP client initialization failed: {e}");
+            return;
+        }
+    };
+    let poll = Duration::from_millis(poll_ms.max(1_000));
+    let mut vol_tracker = VolatilityTracker::new(vol_window);
+    let mut failures = 0u64;
+
+    tracing::info!(%url, poll_ms = poll.as_millis(), "Using market-intel price feed");
+    loop {
+        if cancel.is_cancelled() {
+            return;
+        }
+
+        let result = async {
+            client
+                .get(&url)
+                .send()
+                .await?
+                .error_for_status()?
+                .json::<Value>()
+                .await
+        }
+        .await;
+
+        match result {
+            Ok(signal) => {
+                let quote_enabled =
+                    json_bool_at(&signal, "/recommendation/quote_enabled").unwrap_or(true);
+                let mode = json_str_at(&signal, "/mode").unwrap_or("unknown");
+                if !quote_enabled || mode == "pause" {
+                    failures = failures.saturating_add(1);
+                    state.feed_alive.store(false, Relaxed);
+                    state.intel_size_multiplier.store(0.0, Relaxed);
+                    state.intel_bid_size_multiplier.store(0.0, Relaxed);
+                    state.intel_ask_size_multiplier.store(0.0, Relaxed);
+                    state.price_notify.notify_one();
+                    if failures == 1 || failures % 30 == 0 {
+                        tracing::warn!(mode, quote_enabled, "market-intel signal is not quoteable");
+                    }
+                } else if let Some(price) = market_intel_price(&signal) {
+                    handle_tick(&state, &mut vol_tracker, price, price);
+                    state.intel_spread_add_bps.store(
+                        json_finite_f64_at(&signal, "/recommendation/spread_add_bps")
+                            .filter(|v| v.is_finite())
+                            .unwrap_or(0.0),
+                        Relaxed,
+                    );
+                    state.intel_size_multiplier.store(
+                        bounded_multiplier(
+                            json_finite_f64_at(&signal, "/recommendation/size_multiplier"),
+                            1.0,
+                        ),
+                        Relaxed,
+                    );
+                    state.intel_bid_size_multiplier.store(
+                        bounded_multiplier(
+                            json_finite_f64_at(&signal, "/recommendation/bid_size_multiplier"),
+                            1.0,
+                        ),
+                        Relaxed,
+                    );
+                    state.intel_ask_size_multiplier.store(
+                        bounded_multiplier(
+                            json_finite_f64_at(&signal, "/recommendation/ask_size_multiplier"),
+                            1.0,
+                        ),
+                        Relaxed,
+                    );
+                    state.price_notify.notify_one();
+                    failures = 0;
+                    if !state.feed_alive.load(Relaxed) {
+                        state.feed_alive.store(true, Relaxed);
+                    }
+                } else {
+                    failures = failures.saturating_add(1);
+                    state.feed_alive.store(false, Relaxed);
+                    if failures == 1 || failures % 30 == 0 {
+                        tracing::warn!("market-intel signal did not include a usable price");
+                    }
+                }
+            }
+            Err(e) => {
+                failures = failures.saturating_add(1);
+                state.feed_alive.store(false, Relaxed);
+                if failures == 1 || failures % 30 == 0 {
+                    tracing::warn!("market-intel feed request failed: {e}");
+                }
+            }
+        }
+
+        tokio::select! {
+            _ = cancel.cancelled() => return,
+            _ = sleep(poll) => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn market_intel_price_requires_positive_value() {
+        let signal = serde_json::json!({
+            "recommendation": {
+                "fair_value": 0,
+                "spread_add_bps": 0,
+                "ask_size_multiplier": 0
+            },
+            "reference": {
+                "price": "80.25"
+            }
+        });
+
+        assert_eq!(market_intel_price(&signal), Some(80.25));
+        assert_eq!(
+            json_finite_f64_at(&signal, "/recommendation/ask_size_multiplier"),
+            Some(0.0)
+        );
+        assert_eq!(
+            json_finite_f64_at(&signal, "/recommendation/spread_add_bps"),
+            Some(0.0)
+        );
+    }
+
+    #[test]
+    fn market_intel_multipliers_accept_zero_as_intentional_pause() {
+        assert_eq!(bounded_multiplier(Some(0.0), 1.0), 0.0);
+        assert_eq!(bounded_multiplier(Some(1.5), 1.0), 1.0);
+        assert_eq!(bounded_multiplier(Some(0.45), 1.0), 0.45);
+        assert_eq!(bounded_multiplier(None, 1.0), 1.0);
+    }
 }
 
 pub async fn run_feed(
@@ -49,6 +239,23 @@ pub async fn run_feed(
     vol_window: usize,
     cancel: CancellationToken,
 ) {
+    if let Some(url) = config
+        .market_intel_signal_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|url| !url.is_empty())
+    {
+        run_market_intel_feed(
+            state,
+            url.to_string(),
+            config.market_intel_poll_ms,
+            vol_window,
+            cancel,
+        )
+        .await;
+        return;
+    }
+
     let primary = config.binance_symbol.to_uppercase();
     let cross = config.cross_symbol.to_uppercase();
     let use_cross = !cross.is_empty();

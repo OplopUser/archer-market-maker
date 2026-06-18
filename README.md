@@ -6,6 +6,11 @@
 
 A simple market maker for the Archer Exchange.
 
+This PropAMM workspace version adds conservative defaults around the upstream
+starter: shadow mode is enabled by default, every transaction-sending command
+requires `ARCHER_ENABLE_LIVE_TRADING=true`, and the strategy has explicit
+notional caps, dust filters, and reserve buffers.
+
 Places bid and ask orders on an Archer on-chain orderbook using Binance WebSocket prices as a reference, with optional cross-tick synthetic pricing. Designed to be **easy to understand** and **a starting point** for building your own strategy.
 
 ## How It Works
@@ -110,32 +115,45 @@ binance_symbol = "SOLUSDT"
 # cross_symbol = "BTCUSDT"   # price = SOLUSDT / BTCUSDT
 ```
 
-### 3. Initialize and deposit
+### 3. Preflight and preview
+
+These commands do not send transactions:
 
 ```bash
+cargo run -- market
+cargo run -- preview --mid 150 --base 1.0 --quote 150.0
+cargo run -- run --shadow
+```
+
+### 4. Initialize and deposit
+
+```bash
+export ARCHER_ENABLE_LIVE_TRADING=true
+
 # Create your maker book on-chain (one-time)
 cargo run --release -- init
 
-# Deposit tokens (example: 5 SOL + 750 USDC)
-cargo run --release -- deposit --base 5.0 --quote 750.0
+# Deposit tokens. This size clears the default four-level dust filter.
+cargo run --release -- deposit --base 0.7 --quote 60.0
 ```
 
-### 4. Run
+### 5. Run
 
 ```bash
-# Dry run first (no real transactions)
+# Shadow first. This is also the config default.
 cargo run --release -- run --shadow
 
-# Run for real
-cargo run --release -- run
+# Run for real. Requires ARCHER_ENABLE_LIVE_TRADING=true.
+cargo run --release -- run --live
 ```
 
-### 5. Stop
+### 6. Stop
 
 ```bash
 # Ctrl+C — clears the book on shutdown
 
 # Or emergency kill from another terminal
+export ARCHER_ENABLE_LIVE_TRADING=true
 cargo run --release -- kill
 ```
 
@@ -145,6 +163,8 @@ cargo run --release -- kill
 archer-market-maker <COMMAND>
 
   run         Start the market maker
+  market      Print market metadata without a maker book
+  preview     Preview generated quotes without sending transactions
   init        Initialize maker book on-chain (one-time)
   deposit     Deposit base + quote tokens
   withdraw    Withdraw all funds
@@ -168,14 +188,25 @@ All settings in `config/default.toml`:
 | `feed` | `cross_symbol` | `""` | Cross pair for synthetic pricing (e.g. `BTCUSDT`) |
 | `feed` | `binance_ws_url` | `wss://stream.binance.com:9443/ws` | Binance WebSocket endpoint |
 | `feed` | `staleness_timeout_ms` | `5000` | Pull quotes if feed stale |
-| `strategy` | `spread_levels_bps` | `[2,5,7,10,12,15,20,25]` | Base bps offset per level |
-| `strategy` | `inventory_pct` | `80` | % of inventory to quote |
+| `strategy` | `spread_levels_bps` | `[10,20,35,55]` | Base bps offset per level |
+| `strategy` | `inventory_pct` | `50` | % of inventory to quote |
 | `strategy` | `vol_window` | `300` | Rolling window size (price samples) for volatility |
 | `strategy` | `vol_baseline_bps` | `5.0` | Per-sample vol (bps) at which spreads are unchanged |
 | `strategy` | `vol_max_multiplier` | `5.0` | Maximum spread multiplier from vol scaling |
+| `risk` | `min_quote_notional` | `5.0` | Skip dust quote levels below this notional |
+| `risk` | `max_quote_notional_per_level` | `25.0` | Per-level notional cap |
+| `risk` | `max_total_quote_notional` | `200.0` | Total quote notional cap across both sides |
+| `risk` | `min_base_reserve_pct` | `20.0` | Base inventory kept unquoted |
+| `risk` | `min_quote_reserve_pct` | `20.0` | Quote inventory kept unquoted |
 | `execution` | `heartbeat_interval_ms` | `100` | Max idle time before heartbeat update |
-| `execution` | `priority_fee_microlamports` | `100` | Solana priority fee |
-| `execution` | `shadow_mode` | `false` | Dry run mode |
+| `execution` | `priority_fee_mode` | `dynamic` | Sample account-local recent fees instead of always paying fixed CU price |
+| `execution` | `priority_fee_microlamports` | `100` | Fixed-mode fee and dynamic fallback |
+| `execution` | `priority_fee_max_microlamports` | `5000` | Dynamic fee cap |
+| `execution` | `priority_fee_percentile` | `50` | Recent-fee percentile to pay |
+| `execution` | `priority_fee_cache_ms` | `10000` | Fee sample cache TTL |
+| `execution` | `min_mid_update_interval_ms` | `5000` | Minimum gap for tiny mid-only updates |
+| `execution` | `min_mid_update_ticks` | `25` | Ignore mid-only moves below this tick delta inside the interval |
+| `execution` | `shadow_mode` | `true` | Dry run mode |
 | `monitoring` | `log_level` | `info` | Log verbosity |
 
 ## Project Structure

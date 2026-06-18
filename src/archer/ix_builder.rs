@@ -4,7 +4,7 @@ use solana_sdk::pubkey::Pubkey;
 use solana_sdk::system_program;
 
 use super::config::MarketConfig;
-use super::math::{base_amount_to_lots, quote_amount_to_lots, BookUpdate};
+use super::math::{BookUpdate, base_amount_to_lots, quote_amount_to_lots};
 use super::types::*;
 
 pub fn build_update_mid_price_ix(

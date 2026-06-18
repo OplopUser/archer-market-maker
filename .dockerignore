@@ -1,0 +1,5 @@
+.git
+target
+logs
+*.log
+.DS_Store

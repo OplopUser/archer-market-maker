@@ -9,12 +9,16 @@
 # =============================================================================
 
 [market]
-# SOL USDC market
-market_pubkey = "4G1A6nhCq3QdHMoVVtJ3PZmAHR4temsvXrWgb9yxX7ZN"
+# SOL/USDC market shown as active in the Archer web app.
+market_pubkey = "u8tnfCb1JSSghuNFquQ2beStYgAN1kmd1f1Lhxbaec4"
 maker_keypair_path = "~/.config/solana/id.json"
 
 [connection]
 rpc_url = "https://api.mainnet-beta.solana.com"
+
+# Optional local shared blockhash service. When set, Archer will use this first
+# and only fall back to direct RPC if the shared service is unavailable.
+# shared_blockhash_url = "http://market-intel:8790/api/solana/blockhash"
 
 [feed]
 # Binance symbol — must match your market's pair.
@@ -28,18 +32,23 @@ binance_symbol = "SOLUSDT"
 
 # binance_ws_url = "wss://stream.binance.com:9443/ws"
 
+# Optional local shared market-intel feed. When set, Archer reads fair value
+# from this service instead of opening its own Binance websocket.
+# market_intel_signal_url = "http://market-intel:8790/api/signals/sol_usdc"
+# market_intel_poll_ms = 2000
+
 # If no price update for this long, pull all quotes.
 staleness_timeout_ms = 5000
 
 [strategy]
 # Spread levels in basis points (1 bps = 0.01%).
 # Each value places one bid and one ask at that distance from mid.
-spread_levels_bps = [2.0, 5.0, 7.0, 10.0, 12.0, 15.0, 20.0, 25.0]
+spread_levels_bps = [10.0, 20.0, 35.0, 55.0]
 
 # What % of total deposited inventory to quote across all levels.
 # Each level gets an equal share: inventory_pct / num_levels.
 # 80% means 20% kept as reserve.
-inventory_pct = 80.0
+inventory_pct = 50.0
 
 # Volatility-adjusted spread widening.
 # Tracks realized vol (std dev of log returns) over the last N price samples.
@@ -52,17 +61,94 @@ vol_baseline_bps = 5.0
 # Cap on how much volatility can widen spreads (e.g. 5.0 = max 5x base spreads).
 vol_max_multiplier = 5.0
 
+# Market-intel quote shaping. When market_intel_signal_url is configured, Archer
+# applies the service's spread_add_bps and size multipliers instead of only
+# using its fair value. This is the main adverse-selection guard.
+intel_spread_add_multiplier = 1.0
+max_intel_spread_add_bps = 80.0
+max_intel_spread_tighten_bps = 0.0
+# If market-intel reduces only one side, add extra distance on that side.
+# Example: ask_size_multiplier=0.65 adds up to 14 bps when this cap is 40.
+max_intel_side_spread_add_bps = 40.0
+# Never quote the tightest level inside this per-side edge after all
+# volatility/intel adjustments. Wider configured levels preserve their spacing
+# above this floor.
+min_effective_spread_bps = 62.0
+
+# Optional explicit edge budget. Archer widens the tightest level to at least
+# toxicity_buffer_bps + min_net_edge_bps, then uses this as the expected
+# passive edge check. This lets selective profiles run tighter than the
+# conservative 62 bps floor while still requiring positive expected edge.
+min_net_edge_bps = 0.0
+toxicity_buffer_bps = 0.0
+min_intel_size_multiplier = 0.20
+
+# After a fill, pause or shrink the filled side for a cooldown window. This
+# prevents taker clusters from repeatedly consuming the same side while the
+# market keeps moving through the quote.
+post_fill_cooldown_ms = 900000
+post_fill_side_size_multiplier = 0.0
+post_fill_markout_check_ms = 900000
+post_fill_adverse_markout_bps = 12.0
+post_fill_adverse_cooldown_ms = 3600000
+
+[risk]
+# Skip quote levels smaller than this quote notional. Prevents dust orders.
+min_quote_notional = 5.0
+
+# Per-level notional cap in quote units.
+max_quote_notional_per_level = 25.0
+
+# Total notional cap across both sides. Half is reserved for bids and half for asks.
+max_total_quote_notional = 200.0
+
+# Keep inventory unquoted as an operational reserve.
+min_base_reserve_pct = 20.0
+min_quote_reserve_pct = 20.0
+
 [execution]
 # Heartbeat interval (milliseconds). The engine reacts instantly to price
 # changes from the WebSocket feed. If no price change occurs within this
 # interval, a heartbeat update is sent with the freshest available price.
 heartbeat_interval_ms = 100
 
-# Solana priority fee in microlamports per compute unit.
+# Priority fee mode:
+# - dynamic: sample recent writable-account fees and clamp them.
+# - fixed: use priority_fee_microlamports exactly.
+# - off: send without a compute-unit price.
+priority_fee_mode = "dynamic"
+
+# Fallback/fixed Solana priority fee in microlamports per compute unit.
 priority_fee_microlamports = 100
 
+# Dynamic fee bounds and sampling. A zero minimum lets the bot avoid paying
+# priority fees when the recent account-local market is clearing at 0.
+priority_fee_min_microlamports = 0
+priority_fee_max_microlamports = 5000
+priority_fee_percentile = 50
+priority_fee_cache_ms = 10000
+priority_fee_emergency_multiplier = 4
+
+# Poll the Archer MakerBook directly. Keep this slower when a shared market
+# intel service is already watching the market/RPC health.
+maker_book_poll_interval_ms = 2000
+
+# Skip tiny mid-only refreshes that would mostly burn base transaction fees.
+min_mid_update_interval_ms = 5000
+min_mid_update_ticks = 25
+
+# Replenish missing filled/cancelled levels at most this often. This must stay
+# slow enough that partial fills do not turn into a full-refresh fee loop.
+min_full_refresh_interval_ms = 600000
+
+# Hard guard against slow update churn that stays below the per-minute cap.
+max_tx_per_minute = 20
+max_update_tx_per_10min = 6
+max_clear_book_per_5min = 2
+min_clear_book_interval_ms = 30000
+
 # Shadow mode: compute quotes but don't send transactions.
-shadow_mode = false
+shadow_mode = true
 
 [monitoring]
 log_level = "info"

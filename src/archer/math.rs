@@ -1,7 +1,7 @@
-use anyhow::{Result, ensure, bail};
+use anyhow::{Result, bail, ensure};
 
 use super::config::MarketConfig;
-use super::types::{MakerLevel, MAX_LEVELS};
+use super::types::{MAX_LEVELS, MakerLevel};
 
 pub fn price_to_ticks(price: f64, config: &MarketConfig) -> Result<u64> {
     ensure!(price.is_finite() && price > 0.0, "invalid price: {price}");
@@ -24,7 +24,10 @@ pub fn quote_lots_to_amount(lots: u64, config: &MarketConfig) -> f64 {
 }
 
 pub fn base_amount_to_lots(amount: f64, config: &MarketConfig) -> Result<u64> {
-    ensure!(amount.is_finite() && amount >= 0.0, "invalid base amount: {amount}");
+    ensure!(
+        amount.is_finite() && amount >= 0.0,
+        "invalid base amount: {amount}"
+    );
     if amount == 0.0 {
         return Ok(0);
     }
@@ -34,7 +37,10 @@ pub fn base_amount_to_lots(amount: f64, config: &MarketConfig) -> Result<u64> {
 }
 
 pub fn quote_amount_to_lots(amount: f64, config: &MarketConfig) -> Result<u64> {
-    ensure!(amount.is_finite() && amount >= 0.0, "invalid quote amount: {amount}");
+    ensure!(
+        amount.is_finite() && amount >= 0.0,
+        "invalid quote amount: {amount}"
+    );
     if amount == 0.0 {
         return Ok(0);
     }
@@ -84,8 +90,16 @@ pub fn build_book_update(
     current_mid_price_ticks: u64,
     config: &MarketConfig,
 ) -> Result<BookUpdate> {
-    ensure!(quotes.bids.len() <= MAX_LEVELS, "too many bid levels: {}", quotes.bids.len());
-    ensure!(quotes.asks.len() <= MAX_LEVELS, "too many ask levels: {}", quotes.asks.len());
+    ensure!(
+        quotes.bids.len() <= MAX_LEVELS,
+        "too many bid levels: {}",
+        quotes.bids.len()
+    );
+    ensure!(
+        quotes.asks.len() <= MAX_LEVELS,
+        "too many ask levels: {}",
+        quotes.asks.len()
+    );
 
     for i in 1..quotes.bids.len() {
         ensure!(
@@ -100,11 +114,17 @@ pub fn build_book_update(
         );
     }
     if let (Some(bb), Some(ba)) = (quotes.bids.first(), quotes.asks.first()) {
-        ensure!(bb.price < ba.price, "crossed book: bid {} >= ask {}", bb.price, ba.price);
+        ensure!(
+            bb.price < ba.price,
+            "crossed book: bid {} >= ask {}",
+            bb.price,
+            ba.price
+        );
     }
 
     let new_mid_price_ticks = match (quotes.bids.first(), quotes.asks.first()) {
         (Some(b), Some(a)) => price_to_ticks((b.price + a.price) / 2.0, config)?,
+        (Some(_), None) | (None, Some(_)) if current_mid_price_ticks > 0 => current_mid_price_ticks,
         (Some(b), None) => price_to_ticks(b.price, config)?,
         (None, Some(a)) => price_to_ticks(a.price, config)?,
         (None, None) => bail!("empty quote"),

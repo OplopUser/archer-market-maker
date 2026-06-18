@@ -1,8 +1,7 @@
 use bytemuck::{Pod, Zeroable};
 use solana_sdk::pubkey::Pubkey;
 
-pub const PROGRAM_ID: Pubkey =
-    solana_sdk::pubkey!("Archer8kgiavM61GyusMzaaS2ft5sALtNsD1HxkUPMhy");
+pub const PROGRAM_ID: Pubkey = solana_sdk::pubkey!("Archer8kgiavM61GyusMzaaS2ft5sALtNsD1HxkUPMhy");
 
 pub const MAKER_BOOK_DISCRIMINATOR: [u8; 8] = *b"ACHRMKR1";
 pub const MARKET_STATE_DISCRIMINATOR: [u8; 8] = *b"ACHRMKT1";
@@ -68,10 +67,17 @@ impl MakerBook {
 
     pub fn load(data: &[u8]) -> anyhow::Result<&Self> {
         let size = std::mem::size_of::<Self>();
-        anyhow::ensure!(data.len() >= size, "MakerBook data too short: {} < {size}", data.len());
+        anyhow::ensure!(
+            data.len() >= size,
+            "MakerBook data too short: {} < {size}",
+            data.len()
+        );
         let book: &Self = bytemuck::try_from_bytes(&data[..size])
             .map_err(|e| anyhow::anyhow!("MakerBook bytemuck: {e}"))?;
-        anyhow::ensure!(book.discriminator == MAKER_BOOK_DISCRIMINATOR, "Invalid MakerBook discriminator");
+        anyhow::ensure!(
+            book.discriminator == MAKER_BOOK_DISCRIMINATOR,
+            "Invalid MakerBook discriminator"
+        );
         Ok(book)
     }
 }
@@ -111,10 +117,17 @@ unsafe impl Zeroable for MarketStateHeader {}
 impl MarketStateHeader {
     pub fn load(data: &[u8]) -> anyhow::Result<&Self> {
         let size = std::mem::size_of::<Self>();
-        anyhow::ensure!(data.len() >= size, "MarketState data too short: {} < {size}", data.len());
+        anyhow::ensure!(
+            data.len() >= size,
+            "MarketState data too short: {} < {size}",
+            data.len()
+        );
         let header: &Self = bytemuck::try_from_bytes(&data[..size])
             .map_err(|e| anyhow::anyhow!("MarketState bytemuck: {e}"))?;
-        anyhow::ensure!(header.discriminator == MARKET_STATE_DISCRIMINATOR, "Invalid MarketState discriminator");
+        anyhow::ensure!(
+            header.discriminator == MARKET_STATE_DISCRIMINATOR,
+            "Invalid MarketState discriminator"
+        );
         Ok(header)
     }
 }

@@ -6,6 +6,7 @@ target/
 *.log
 log-*.txt
 log-*/
+logs/
 !log-collector/
 !log-analyzer/*
 !log-utils/
@@ -14,6 +15,12 @@ log-*/
 .env
 .env.*
 *.pem
+config/adaptive-live.toml
+config/live-*.toml
+config/night-sweep/
+docker-compose.tuxedo.yml
+scripts/archer_night_sweep.sh
+scripts/archer_usdc_style_12h.sh
 
 # Terraform
 terraform.tfvars

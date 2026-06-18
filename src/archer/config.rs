@@ -40,18 +40,16 @@ impl MarketConfig {
         let ticks_to_price_factor = header.tick_size_in_quote_atoms_per_base_unit as f64
             / (header.raw_base_units_per_base_unit as f64 * quote_atoms_divisor);
 
-        let lots_to_base_amount_factor =
-            header.base_atoms_per_base_lot as f64 / base_atoms_divisor;
+        let lots_to_base_amount_factor = header.base_atoms_per_base_lot as f64 / base_atoms_divisor;
 
         let lots_to_quote_amount_factor =
             header.quote_atoms_per_quote_lot as f64 / quote_atoms_divisor;
 
-        let base_vault =
-            spl_associated_token_account::get_associated_token_address_with_program_id(
-                &market_pubkey,
-                &header.base_mint,
-                &base_token_program,
-            );
+        let base_vault = spl_associated_token_account::get_associated_token_address_with_program_id(
+            &market_pubkey,
+            &header.base_mint,
+            &base_token_program,
+        );
         let quote_vault =
             spl_associated_token_account::get_associated_token_address_with_program_id(
                 &market_pubkey,

@@ -8,6 +8,8 @@ use solana_sdk::signature::{Keypair, Signature};
 use solana_sdk::signer::Signer;
 use solana_sdk::transaction::Transaction;
 
+use crate::tx::{PriorityFeeConfig, TxPriority, resolve_priority_fee};
+
 use super::accounts;
 use super::config::MarketConfig;
 use super::types::MakerBook;
@@ -19,6 +21,8 @@ pub struct ArcherClient {
 #[derive(Debug, Clone)]
 pub struct SendOptions {
     pub priority_fee_micro_lamports: Option<u64>,
+    pub priority_fee_config: Option<PriorityFeeConfig>,
+    pub priority: TxPriority,
     pub compute_unit_limit: Option<u32>,
     pub max_retries: u32,
 }
@@ -27,6 +31,8 @@ impl Default for SendOptions {
     fn default() -> Self {
         Self {
             priority_fee_micro_lamports: None,
+            priority_fee_config: None,
+            priority: TxPriority::Normal,
             compute_unit_limit: None,
             max_retries: 3,
         }
@@ -34,8 +40,18 @@ impl Default for SendOptions {
 }
 
 impl SendOptions {
-    pub fn with_priority_fee(mut self, micro_lamports: u64) -> Self {
-        self.priority_fee_micro_lamports = Some(micro_lamports);
+    pub fn with_dynamic_priority_fee(
+        mut self,
+        config: PriorityFeeConfig,
+        priority: TxPriority,
+    ) -> Self {
+        self.priority_fee_config = Some(config);
+        self.priority = priority;
+        self
+    }
+
+    pub fn with_compute_unit_limit(mut self, compute_unit_limit: u32) -> Self {
+        self.compute_unit_limit = Some(compute_unit_limit);
         self
     }
 }
@@ -43,10 +59,7 @@ impl SendOptions {
 impl ArcherClient {
     pub fn new(rpc_url: &str) -> Self {
         Self {
-            rpc: RpcClient::new_with_commitment(
-                rpc_url.to_string(),
-                CommitmentConfig::confirmed(),
-            ),
+            rpc: RpcClient::new_with_commitment(rpc_url.to_string(), CommitmentConfig::confirmed()),
         }
     }
 
@@ -105,8 +118,19 @@ impl ArcherClient {
         if let Some(limit) = options.compute_unit_limit {
             all_ixs.push(ComputeBudgetInstruction::set_compute_unit_limit(limit));
         }
-        if let Some(fee) = options.priority_fee_micro_lamports {
-            all_ixs.push(ComputeBudgetInstruction::set_compute_unit_price(fee));
+        let priority_fee = if let Some(fee) = options.priority_fee_micro_lamports {
+            fee
+        } else if let Some(config) = options.priority_fee_config.as_ref() {
+            resolve_priority_fee(&self.rpc, instructions, options.priority, config, None)
+                .await
+                .fee_microlamports
+        } else {
+            0
+        };
+        if priority_fee > 0 {
+            all_ixs.push(ComputeBudgetInstruction::set_compute_unit_price(
+                priority_fee,
+            ));
         }
 
         all_ixs.extend_from_slice(instructions);
