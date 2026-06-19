@@ -25,7 +25,20 @@ from typing import Any, Dict, List, Optional, Tuple
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from dashboard.server import DashboardState, iso, load_simple_toml, pubkey_from_keypair_json, run_cmd
+# The adaptive watchdog uses dashboard readback for safety. Live Archer RPC
+# commands can exceed the dashboard module's 2s default, so keep the controller
+# default aligned with the run dashboard unless the operator overrides it.
+os.environ.setdefault("ARCHER_DASHBOARD_COMMAND_TIMEOUT", "20")
+os.environ.setdefault("ARCHER_DASHBOARD_RPC_TIMEOUT", "10")
+
+from dashboard.server import (
+    DashboardState,
+    classify_archer_live_status,
+    iso,
+    load_simple_toml,
+    pubkey_from_keypair_json,
+    run_cmd,
+)
 
 
 BIN = ROOT / "target" / "release" / "archer-market-maker"
@@ -319,12 +332,27 @@ class AdaptiveController:
         self.ledger_jsonl = self.run_dir / "strategy-ledger.jsonl"
         self.ledger_md = self.run_dir / "strategy-ledger.md"
         self.active_strategy_json = self.run_dir / "active-strategy.json"
+        self.heartbeat_json = self.run_dir / "controller-heartbeat.json"
         self.commands_log = self.run_dir / "commands.log"
         self.bot_log = self.run_dir / "bot.log"
         self.config_base = load_simple_toml(SOURCE_CONFIG)
         maker_keypair_path = os.environ.get("ARCHER_MAKER_KEYPAIR_PATH")
         if maker_keypair_path:
             self.config_base.setdefault("market", {})["maker_keypair_path"] = maker_keypair_path
+        market_intel_signal_url = os.environ.get("ARCHER_MARKET_INTEL_SIGNAL_URL")
+        if market_intel_signal_url:
+            feed = self.config_base.setdefault("feed", {})
+            if market_intel_signal_url.lower() in {"disabled", "none", "off"}:
+                feed.pop("market_intel_signal_url", None)
+            else:
+                feed["market_intel_signal_url"] = market_intel_signal_url
+        shared_blockhash_url = os.environ.get("ARCHER_SHARED_BLOCKHASH_URL")
+        if shared_blockhash_url:
+            connection = self.config_base.setdefault("connection", {})
+            if shared_blockhash_url.lower() in {"disabled", "none", "off"}:
+                connection.pop("shared_blockhash_url", None)
+            else:
+                connection["shared_blockhash_url"] = shared_blockhash_url
         self.rpc_url = str(self.config_base["connection"]["rpc_url"])
         self.wallet_pubkey = self.discover_wallet_pubkey()
         if initial_profile not in PROFILES:
@@ -333,6 +361,22 @@ class AdaptiveController:
         self.initial_reason = initial_reason
         self.stop_requested = False
         self.profile_entered_at = time.time()
+
+    def write_controller_heartbeat(self, event: str, reason: Optional[str] = None) -> None:
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        self.heartbeat_json.write_text(
+            json.dumps(
+                {
+                    "time": iso(),
+                    "run_id": self.run_id,
+                    "profile": self.current_profile,
+                    "event": event,
+                    "reason": reason,
+                },
+                indent=2,
+                sort_keys=True,
+            )
+        )
 
     def discover_wallet_pubkey(self) -> str:
         wallet = str(self.config_base["market"]["maker_keypair_path"])
@@ -521,12 +565,19 @@ log_level = "{monitoring.get('log_level', 'info')}"
         status = metrics.get("status", {})
         market = metrics.get("market", {})
         logs = metrics.get("logs", {}).get("counts", {})
+        live_status = metrics.get("archer_live_status") or classify_archer_live_status(metrics)
+        alert = live_status.get("alert", {})
         return {
             "mid_price": metrics.get("mid_price"),
             "market_command_ok": market.get("command_ok"),
             "status_command_ok": status.get("command_ok"),
             "status_stale": status.get("stale"),
             "status_source": status.get("source"),
+            "live_state": live_status.get("state"),
+            "live_action": live_status.get("action"),
+            "live_restart_policy": live_status.get("restart_policy"),
+            "live_alert_severity": alert.get("severity"),
+            "live_alert_reason": alert.get("reason"),
             "bid_levels": status.get("bid_levels"),
             "ask_levels": status.get("ask_levels"),
             "base_total": status.get("base_total"),
@@ -641,11 +692,13 @@ log_level = "{monitoring.get('log_level', 'info')}"
         state = DashboardState(ACTIVE_CONFIG, self.run_dir, 30, 5000, 120)
         last_metrics: Optional[Dict[str, Any]] = None
         for attempt in range(1, 4):
+            self.write_controller_heartbeat("collect_metrics", f"attempt {attempt}")
             metrics = state.collect_cached(force=True, record=True)
             last_metrics = metrics
             market = metrics.get("market", {})
             status = metrics.get("status", {})
-            if market.get("command_ok") and status.get("command_ok") and not status.get("stale"):
+            live_status = metrics.get("archer_live_status") or classify_archer_live_status(metrics)
+            if live_status.get("action") in {"continue", "continue_degraded", "quote_reduce_only"}:
                 return metrics
             self.log(
                 "Live metrics collection returned non-live status "
@@ -654,6 +707,8 @@ log_level = "{monitoring.get('log_level', 'info')}"
                 f"status_ok={status.get('command_ok')}, "
                 f"status_stale={status.get('stale')}, "
                 f"status_source={status.get('source')}, "
+                f"live_state={live_status.get('state')}, "
+                f"live_action={live_status.get('action')}, "
                 f"status_error={status.get('command_error') or market.get('command_error')}"
             )
             time.sleep(2 * attempt)
@@ -750,16 +805,30 @@ log_level = "{monitoring.get('log_level', 'info')}"
         rpc_429 = int(logs.get("rpc_429") or 0)
         status = metrics.get("status", {})
         market = metrics.get("market", {})
+        live_status = metrics.get("archer_live_status") or classify_archer_live_status(metrics)
+        live_action = live_status.get("action")
+        live_alert = live_status.get("alert", {})
 
-        if not market.get("command_ok") or not status.get("command_ok") or status.get("stale"):
+        if live_action in {"clear_book", "stop_supervised"}:
             return (
                 "__stop__",
-                "live status unavailable; refusing to trade on stale or snapshot metrics: "
+                "live status failover action requires supervised stop: "
+                f"state={live_status.get('state')}, action={live_action}, "
+                f"restart_policy={live_status.get('restart_policy')}, "
+                f"alert={live_alert.get('reason')}; "
                 f"market_ok={market.get('command_ok')}, "
                 f"status_ok={status.get('command_ok')}, "
                 f"status_stale={status.get('stale')}, "
                 f"status_source={status.get('source')}, "
                 f"status_error={status.get('command_error') or market.get('command_error')}",
+            )
+        if live_action == "quote_reduce_only":
+            return (
+                "fee_guard_passive_80",
+                "live status failover action quote_reduce_only: "
+                f"state={live_status.get('state')}, "
+                f"restart_policy={live_status.get('restart_policy')}, "
+                f"alert={live_alert.get('reason')}",
             )
 
         prev_fee = float(previous.get("fee_usdc") or 0.0) if previous else 0.0
@@ -953,9 +1022,14 @@ log_level = "{monitoring.get('log_level', 'info')}"
     def decide_watchdog_stop(self, metrics: Dict[str, Any], previous: Optional[Dict[str, Any]]) -> Optional[str]:
         status = metrics.get("status", {})
         market = metrics.get("market", {})
-        if not market.get("command_ok") or not status.get("command_ok") or status.get("stale"):
+        live_status = metrics.get("archer_live_status") or classify_archer_live_status(metrics)
+        live_action = live_status.get("action")
+        if live_action in {"clear_book", "stop_supervised"}:
             return (
-                "fast watchdog: live status unavailable; stopping instead of trading blind: "
+                "fast watchdog: live status failover action requires supervised stop: "
+                f"state={live_status.get('state')}, action={live_action}, "
+                f"restart_policy={live_status.get('restart_policy')}, "
+                f"alert={live_status.get('alert', {}).get('reason')}; "
                 f"market_ok={market.get('command_ok')}, "
                 f"status_ok={status.get('command_ok')}, "
                 f"status_stale={status.get('stale')}, "
@@ -984,8 +1058,7 @@ log_level = "{monitoring.get('log_level', 'info')}"
         window_tx_circuit = max(0, tx_circuit - prev_tx_circuit)
 
         if (
-            window_tx_circuit > 0
-            or window_stale >= WATCHDOG_STALE_STOP
+            window_stale >= WATCHDOG_STALE_STOP
             or window_rpc_429 >= WATCHDOG_RPC429_STOP
             or window_failed >= WATCHDOG_FAILED_STOP
             or window_tx >= WATCHDOG_TX_STOP
@@ -1033,6 +1106,7 @@ log_level = "{monitoring.get('log_level', 'info')}"
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.log(f"Starting adaptive Archer 12h run_id={self.run_id} duration_seconds={self.duration_seconds} evaluation_seconds={self.evaluation_seconds}")
         self.log(f"Logs: {self.run_dir}")
+        self.write_controller_heartbeat("start", self.initial_reason)
         self.write_active_config(self.current_profile, self.initial_reason)
 
         for screen in OLD_SCREENS + [ACTIVE_SCREEN]:
@@ -1065,6 +1139,7 @@ log_level = "{monitoring.get('log_level', 'info')}"
             sleep_until = time.time() + self.evaluation_seconds
             self.log(f"Sleeping {int(self.evaluation_seconds)}s before next adaptive evaluation")
             while not self.stop_requested and time.time() < sleep_until and time.time() < end_at:
+                self.write_controller_heartbeat("watchdog_sleep", f"hour_index={hour_index}")
                 sleep_for = min(WATCHDOG_SECONDS, sleep_until - time.time(), end_at - time.time())
                 if sleep_for > 0:
                     time.sleep(sleep_for)
@@ -1089,6 +1164,7 @@ log_level = "{monitoring.get('log_level', 'info')}"
             if self.stop_requested or time.time() >= end_at:
                 break
             hour_index += 1
+            self.write_controller_heartbeat("hourly_evaluation", f"hour_index={hour_index}")
             previous = self.load_last_eval_metrics()
             metrics = self.collect_metrics()
             watchdog_previous = metrics
@@ -1096,6 +1172,7 @@ log_level = "{monitoring.get('log_level', 'info')}"
             self.switch_profile(next_profile, reason, metrics=metrics, event=f"hour_{hour_index}_evaluation")
 
         self.snapshot("98_before_stop")
+        self.write_controller_heartbeat("final_clear", "adaptive run ending")
         self.stop_screen(ACTIVE_SCREEN)
         self.stop_bot_processes()
         self.clear_book()
@@ -1106,6 +1183,7 @@ log_level = "{monitoring.get('log_level', 'info')}"
             self.log(f"Final metrics collection failed: {exc}")
         self.snapshot("99_after_clear")
         self.append_ledger("complete", self.current_profile, "adaptive 12h controller completed; book cleared", metrics=final_metrics)
+        self.write_controller_heartbeat("complete", "adaptive 12h controller completed; book cleared")
         self.log("Adaptive Archer run complete. Book cleared; funds remain in MakerBook free balances unless withdrawn separately.")
 
 

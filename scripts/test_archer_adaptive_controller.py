@@ -8,6 +8,7 @@ import unittest
 from scripts.archer_adaptive_12h import (
     AdaptiveController,
     PROFILES,
+    classify_archer_live_status,
     profile_edge_floor_bps,
     profile_validation_defaults,
 )
@@ -23,14 +24,29 @@ def metrics(
     mid_price: float = 80.0,
     intel_spread_add_bps: float = 0.0,
     tx_count: int = 5,
+    failed_count: int = 0,
+    price_feed_stale: int = 0,
+    rpc_429: int = 0,
+    tx_circuit_breaker: int = 0,
+    dashboard_ok: bool = True,
+    dashboard_stale: bool = False,
+    rpc_ok: bool = True,
+    rpc_stale: bool = False,
+    heartbeat_ok: bool = True,
 ) -> dict:
     return {
         "market": {"command_ok": True},
         "status": {
             "command_ok": True,
-            "stale": False,
+            "stale": dashboard_stale,
             "base_total": base_total,
             "quote_total": quote_total,
+        },
+        "dashboard_health": {"ok": dashboard_ok, "stale": dashboard_stale},
+        "archer_live_status": {
+            "rpc_healthy": rpc_ok,
+            "rpc_stale": rpc_stale,
+            "heartbeat_healthy": heartbeat_ok,
         },
         "mid_price": mid_price,
         "market_intel": {"spread_add_bps": intel_spread_add_bps},
@@ -42,8 +58,14 @@ def metrics(
             "base_delta": base_delta,
             "quote_delta": quote_delta,
         },
-        "transactions": {"failed_count": 0, "since_start_count": tx_count},
-        "logs": {"counts": {"price_feed_stale": 0, "rpc_429": 0}},
+        "transactions": {"failed_count": failed_count, "since_start_count": tx_count},
+        "logs": {
+            "counts": {
+                "price_feed_stale": price_feed_stale,
+                "rpc_429": rpc_429,
+                "tx_circuit_breaker": tx_circuit_breaker,
+            }
+        },
     }
 
 
@@ -135,6 +157,119 @@ class AdaptiveControllerProfitGuardTests(unittest.TestCase):
 
         self.assertEqual(profile, "overnight_balanced_low_churn")
         self.assertNotIn("fill toxicity guard", reason)
+
+    def test_watchdog_does_not_stop_on_tx_circuit_throttle_only(self) -> None:
+        controller = self.controller()
+        previous = metrics(net=0.0, quote_delta=0.0, tx_count=3, tx_circuit_breaker=2)
+        current = metrics(net=0.0, quote_delta=0.0, tx_count=3, tx_circuit_breaker=3)
+
+        reason = controller.decide_watchdog_stop(current, previous)
+
+        self.assertIsNone(reason)
+
+    def test_watchdog_still_stops_on_stale_feed_burst(self) -> None:
+        controller = self.controller()
+        previous = metrics(net=0.0, quote_delta=0.0, price_feed_stale=0)
+        current = metrics(net=0.0, quote_delta=0.0, price_feed_stale=2)
+
+        reason = controller.decide_watchdog_stop(current, previous)
+
+        self.assertIsNotNone(reason)
+        self.assertIn("window_stale=2", reason or "")
+
+    def test_dashboard_down_rpc_healthy_continues_degraded(self) -> None:
+        status = classify_archer_live_status(
+            metrics(
+                net=0.0,
+                quote_delta=0.0,
+                dashboard_ok=False,
+                dashboard_stale=True,
+                rpc_ok=True,
+                rpc_stale=False,
+                heartbeat_ok=True,
+            )
+        )
+
+        self.assertEqual(status["state"], "dashboard_down_rpc_healthy")
+        self.assertEqual(status["action"], "continue_degraded")
+        self.assertEqual(status["restart_policy"], "restart_allowed")
+        self.assertEqual(status["alert"]["severity"], "warning")
+
+    def test_rpc_stale_dashboard_healthy_quotes_reduce_only(self) -> None:
+        status = classify_archer_live_status(
+            metrics(
+                net=0.0,
+                quote_delta=0.0,
+                dashboard_ok=True,
+                dashboard_stale=False,
+                rpc_ok=True,
+                rpc_stale=True,
+                heartbeat_ok=True,
+            )
+        )
+
+        self.assertEqual(status["state"], "rpc_stale_dashboard_healthy")
+        self.assertEqual(status["action"], "quote_reduce_only")
+        self.assertEqual(status["restart_policy"], "manual_only")
+        self.assertEqual(status["alert"]["severity"], "warning")
+
+    def test_both_stale_clears_book(self) -> None:
+        status = classify_archer_live_status(
+            metrics(
+                net=0.0,
+                quote_delta=0.0,
+                dashboard_ok=True,
+                dashboard_stale=True,
+                rpc_ok=True,
+                rpc_stale=True,
+                heartbeat_ok=True,
+            )
+        )
+
+        self.assertEqual(status["state"], "both_stale")
+        self.assertEqual(status["action"], "clear_book")
+        self.assertEqual(status["restart_policy"], "manual_only")
+        self.assertEqual(status["alert"]["severity"], "critical")
+
+    def test_heartbeat_missing_stops_supervised(self) -> None:
+        status = classify_archer_live_status(
+            metrics(
+                net=0.0,
+                quote_delta=0.0,
+                dashboard_ok=True,
+                dashboard_stale=False,
+                rpc_ok=True,
+                rpc_stale=False,
+                heartbeat_ok=False,
+            )
+        )
+
+        self.assertEqual(status["state"], "heartbeat_missing")
+        self.assertEqual(status["action"], "stop_supervised")
+        self.assertEqual(status["restart_policy"], "manual_only")
+        self.assertEqual(status["alert"]["severity"], "critical")
+
+    def test_stale_dashboard_alone_does_not_make_bot_non_live(self) -> None:
+        controller = self.controller()
+        current = metrics(
+            net=0.0,
+            quote_delta=0.0,
+            dashboard_ok=True,
+            dashboard_stale=True,
+            rpc_ok=True,
+            rpc_stale=False,
+            heartbeat_ok=True,
+        )
+
+        status = classify_archer_live_status(current)
+        profile, reason = controller.decide_next_profile(current, previous_metrics(), 1)
+        stop_reason = controller.decide_watchdog_stop(current, metrics(net=0.0, quote_delta=0.0))
+
+        self.assertEqual(status["state"], "dashboard_down_rpc_healthy")
+        self.assertEqual(status["action"], "continue_degraded")
+        self.assertEqual(profile, "overnight_balanced_low_churn")
+        self.assertNotIn("live status unavailable", reason)
+        self.assertIsNone(stop_reason)
 
 
 if __name__ == "__main__":

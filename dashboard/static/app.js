@@ -122,10 +122,14 @@ function renderHealth(data) {
   const process = data.process || {};
   const logs = data.logs?.counts || {};
   const tx = data.transactions || {};
+  const live = data.archer_live_status || {};
   const kindCounts = tx.kind_counts || {};
   const txMix = `mid+book ${kindCounts.mid_book || 0} · book ${kindCounts.book_only || 0} · mid ${kindCounts.mid_only || 0} · clear ${kindCounts.clear || 0}`;
   const txMixState = (kindCounts.clear || 0) > 1 ? "warn" : "ok";
+  const liveState = live.state ? `${live.state} · ${live.action || "--"}` : "--";
+  const liveRowState = live.alert?.severity === "critical" ? "bad" : live.alert?.severity === "warning" ? "warn" : "ok";
   const rows = [
+    healthRow("Archer live status", liveState, liveRowState),
     healthRow("Controller", process.controller_running ? "running" : "down", process.controller_running ? "ok" : "bad"),
     healthRow("Bot process", process.bot_running ? "running" : "down", process.bot_running ? "ok" : "bad"),
     healthRow("Price feed stale", String(logs.price_feed_stale || 0), logs.price_feed_stale ? "warn" : "ok"),

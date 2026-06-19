@@ -48,6 +48,9 @@ ARCHER_IX_NAMES = {
 RUN_PREFIXES = ("adaptive-12h-", "usdc-style-12h-")
 DASHBOARD_COMMAND_TIMEOUT = float(os.environ.get("ARCHER_DASHBOARD_COMMAND_TIMEOUT", "2"))
 DASHBOARD_RPC_TIMEOUT = float(os.environ.get("ARCHER_DASHBOARD_RPC_TIMEOUT", "1.5"))
+CONTROLLER_HEARTBEAT_MAX_AGE_SECONDS = float(
+    os.environ.get("ARCHER_CONTROLLER_HEARTBEAT_MAX_AGE_SECONDS", "90")
+)
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 
@@ -57,6 +60,107 @@ def now_utc() -> dt.datetime:
 
 def iso(ts: Optional[dt.datetime] = None) -> str:
     return (ts or now_utc()).isoformat().replace("+00:00", "Z")
+
+
+def parse_iso_time(value: Any) -> Optional[dt.datetime]:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = dt.datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=dt.timezone.utc)
+    return parsed.astimezone(dt.timezone.utc)
+
+
+def classify_archer_live_status(metrics: Dict[str, Any]) -> Dict[str, Any]:
+    existing = metrics.get("archer_live_status")
+    existing = existing if isinstance(existing, dict) else {}
+    dashboard = metrics.get("dashboard_health")
+    dashboard = dashboard if isinstance(dashboard, dict) else {}
+    heartbeat = metrics.get("controller_heartbeat")
+    heartbeat = heartbeat if isinstance(heartbeat, dict) else {}
+    status = metrics.get("status")
+    status = status if isinstance(status, dict) else {}
+    market = metrics.get("market")
+    market = market if isinstance(market, dict) else {}
+
+    dashboard_healthy = bool(
+        existing.get("dashboard_healthy", dashboard.get("ok", True))
+    )
+    dashboard_stale = bool(
+        existing.get(
+            "dashboard_stale",
+            dashboard.get("stale", False) or metrics.get("cache", {}).get("stale", False),
+        )
+    )
+    rpc_healthy = bool(
+        existing.get(
+            "rpc_healthy",
+            market.get("command_ok", False) and status.get("command_ok", False),
+        )
+    )
+    rpc_stale = bool(
+        existing.get(
+            "rpc_stale",
+            (not rpc_healthy) or status.get("rpc_stale", False),
+        )
+    )
+    heartbeat_healthy = bool(
+        existing.get("heartbeat_healthy", heartbeat.get("healthy", True))
+    )
+
+    if not heartbeat_healthy:
+        state = "heartbeat_missing"
+        action = "stop_supervised"
+        restart_policy = "manual_only"
+        severity = "critical"
+        reason = "controller heartbeat is missing or stale; supervised stop required before trusting metrics"
+    elif rpc_stale and dashboard_stale:
+        state = "both_stale"
+        action = "clear_book"
+        restart_policy = "manual_only"
+        severity = "critical"
+        reason = "dashboard snapshot and direct Archer RPC readback are stale; clear live book before continuing"
+    elif rpc_stale and dashboard_healthy and not dashboard_stale:
+        state = "rpc_stale_dashboard_healthy"
+        action = "quote_reduce_only"
+        restart_policy = "manual_only"
+        severity = "warning"
+        reason = "dashboard is fresh but direct Archer RPC readback is stale; reduce quote risk only"
+    elif (not dashboard_healthy or dashboard_stale) and rpc_healthy and not rpc_stale:
+        state = "dashboard_down_rpc_healthy"
+        action = "continue_degraded"
+        restart_policy = "restart_allowed"
+        severity = "warning"
+        reason = "dashboard snapshot/cache is unavailable or stale, but direct Archer RPC readback and heartbeat are healthy"
+    else:
+        state = "healthy"
+        action = "continue"
+        restart_policy = "restart_allowed"
+        severity = "info"
+        reason = "dashboard, direct Archer RPC readback, and controller heartbeat are healthy"
+
+    return {
+        "state": state,
+        "action": action,
+        "restart_policy": restart_policy,
+        "dashboard_healthy": dashboard_healthy,
+        "dashboard_stale": dashboard_stale,
+        "rpc_healthy": rpc_healthy,
+        "rpc_stale": rpc_stale,
+        "heartbeat_healthy": heartbeat_healthy,
+        "bot_live": rpc_healthy and not rpc_stale and heartbeat_healthy,
+        "alert": {
+            "state": state,
+            "action": action,
+            "severity": severity,
+            "reason": reason,
+            "restart_policy": restart_policy,
+        },
+        "reason": reason,
+    }
 
 
 def run_cmd(args: List[str], timeout: float = 8.0) -> Dict[str, Any]:
@@ -486,11 +590,60 @@ class DashboardState:
             parsed = self.get_snapshot_status()
             if parsed:
                 parsed["stale"] = True
+                parsed["rpc_stale"] = True
         else:
             parsed["stale"] = False
+            parsed["rpc_stale"] = False
+            parsed["source"] = "archer_status_command"
         parsed["command_ok"] = cmd["ok"]
         parsed["command_error"] = cmd["stderr"].strip()
         return parsed
+
+    def get_dashboard_health(self, status: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "ok": True,
+            "stale": bool(status.get("stale")),
+            "status_source": status.get("source"),
+            "separated_from_bot_health": True,
+        }
+
+    def get_controller_heartbeat(self, process: Dict[str, Any]) -> Dict[str, Any]:
+        if not self.run_dir:
+            return {
+                "healthy": not process.get("controller_running", False),
+                "available": False,
+                "reason": "no run directory",
+            }
+        path = self.run_dir / "controller-heartbeat.json"
+        if not path.exists():
+            return {
+                "healthy": not process.get("controller_running", False),
+                "available": False,
+                "path": str(path),
+                "reason": "heartbeat file missing",
+            }
+        try:
+            data = json.loads(path.read_text(errors="replace"))
+        except json.JSONDecodeError as exc:
+            return {
+                "healthy": False,
+                "available": False,
+                "path": str(path),
+                "reason": f"heartbeat parse failed: {exc}",
+            }
+        last_seen = parse_iso_time(data.get("time"))
+        age_seconds = (now_utc() - last_seen).total_seconds() if last_seen else None
+        healthy = age_seconds is not None and age_seconds <= CONTROLLER_HEARTBEAT_MAX_AGE_SECONDS
+        return {
+            "healthy": healthy,
+            "available": True,
+            "path": str(path),
+            "time": data.get("time"),
+            "age_seconds": age_seconds,
+            "profile": data.get("profile"),
+            "event": data.get("event"),
+            "reason": None if healthy else "heartbeat stale",
+        }
 
     def get_wallet_balances(self) -> Dict[str, Any]:
         balances = {
@@ -881,6 +1034,7 @@ class DashboardState:
         self.rpc_url = str(self.config.get("connection", {}).get("rpc_url", self.rpc_url))
         market = self.get_market_meta()
         status = self.get_status()
+        dashboard_health = self.get_dashboard_health(status)
         rpc_unhealthy = not market.get("command_ok", False) or not status.get("command_ok", False)
         tick = market.get("tick_price_increment", 0.001)
         mid_price = status.get("mid_ticks") * tick if status.get("mid_ticks") else None
@@ -907,6 +1061,7 @@ class DashboardState:
             transactions = self.get_transactions()
             balances = self.get_wallet_balances()
         process = self.get_process_state()
+        controller_heartbeat = self.get_controller_heartbeat(process)
         logs = self.get_logs()
         market_intel = self.get_market_intel()
         run_end = self.run_start + dt.timedelta(seconds=self.duration_seconds) if self.run_start else None
@@ -938,6 +1093,7 @@ class DashboardState:
             },
             "market": market,
             "status": status,
+            "dashboard_health": dashboard_health,
             "mid_price": mid_price,
             "baseline": baseline,
             "pnl": self.compute_pnl(status, baseline, transactions, mid_price),
@@ -948,6 +1104,7 @@ class DashboardState:
             "transactions": transactions,
             "market_intel": market_intel,
             "process": process,
+            "controller_heartbeat": controller_heartbeat,
             "logs": logs,
             "strategy": {
                 "active_profile": strategy_ledger.get("active", {}).get("profile")
@@ -997,6 +1154,7 @@ class DashboardState:
             },
             "strategy_ledger": strategy_ledger,
         }
+        metrics["archer_live_status"] = classify_archer_live_status(metrics)
         return metrics
 
     def sample_from_metrics(self, metrics: Dict[str, Any]) -> Dict[str, Any]:
@@ -1004,6 +1162,7 @@ class DashboardState:
         status = metrics.get("status", {})
         tx = metrics.get("transactions", {})
         market_intel = metrics.get("market_intel", {})
+        live_status = metrics.get("archer_live_status", {})
         return {
             "time": metrics.get("time"),
             "mid_price": metrics.get("mid_price"),
@@ -1020,6 +1179,9 @@ class DashboardState:
             "tx_count": tx.get("since_start_count"),
             "tx_failed": tx.get("failed_count"),
             "tx_kind_counts": tx.get("kind_counts"),
+            "live_state": live_status.get("state"),
+            "live_action": live_status.get("action"),
+            "live_restart_policy": live_status.get("restart_policy"),
             "intel_mode": market_intel.get("mode"),
             "intel_fair_value": market_intel.get("fair_value"),
             "intel_spread_add_bps": market_intel.get("spread_add_bps"),
@@ -1053,6 +1215,14 @@ class DashboardState:
                         cached_at, tz=dt.timezone.utc
                     ).isoformat().replace("+00:00", "Z"),
                 }
+                stale["dashboard_health"] = {
+                    **(stale.get("dashboard_health") or {}),
+                    "ok": False,
+                    "stale": True,
+                    "reason": "live metrics collection already in progress",
+                    "separated_from_bot_health": True,
+                }
+                stale["archer_live_status"] = classify_archer_live_status(stale)
                 return stale
             return {
                 "time": iso(),

@@ -256,17 +256,19 @@ impl TxSender {
             .expect("tx budget mutex poisoned")
             .reserve(Instant::now(), purpose, &self.budget_config);
         if let Err(reason) = reserve_result {
-            self.state.tx_circuit_open.store(true, Relaxed);
-            self.state.tx_circuit_reason.store(reason as u64, Relaxed);
+            if tx_budget_rejection_opens_circuit(reason) {
+                self.state.tx_circuit_open.store(true, Relaxed);
+                self.state.tx_circuit_reason.store(reason as u64, Relaxed);
+            }
             self.state.tx_budget_drops.fetch_add(1, Relaxed);
-            tracing::error!(
+            tracing::warn!(
                 ?reason,
                 ?purpose,
                 max_tx_per_minute = self.budget_config.max_tx_per_minute,
                 max_update_tx_per_10min = self.budget_config.max_update_tx_per_10min,
                 max_clear_book_per_5min = self.budget_config.max_clear_book_per_5min,
                 min_clear_book_interval_ms = self.budget_config.min_clear_book_interval.as_millis(),
-                "TX circuit breaker opened; dropping transaction"
+                "TX budget throttle; dropping transaction"
             );
             return;
         }
@@ -307,6 +309,16 @@ impl TxSender {
             }
         });
     }
+}
+
+fn tx_budget_rejection_opens_circuit(reason: TxCircuitReason) -> bool {
+    !matches!(
+        reason,
+        TxCircuitReason::TxRateExceeded
+            | TxCircuitReason::ClearBookRateExceeded
+            | TxCircuitReason::ClearBookCooldown
+            | TxCircuitReason::UpdateRateExceeded
+    )
 }
 
 async fn get_or_refresh_blockhash(
@@ -658,6 +670,32 @@ mod tests {
             budget.reserve(now + Duration::from_secs(240), TxPurpose::Update, &config),
             Err(TxCircuitReason::UpdateRateExceeded)
         );
+    }
+
+    #[test]
+    fn budget_rejections_are_soft_throttles_not_hard_circuits() {
+        assert!(!tx_budget_rejection_opens_circuit(
+            TxCircuitReason::TxRateExceeded
+        ));
+        assert!(!tx_budget_rejection_opens_circuit(
+            TxCircuitReason::ClearBookRateExceeded
+        ));
+        assert!(!tx_budget_rejection_opens_circuit(
+            TxCircuitReason::ClearBookCooldown
+        ));
+        assert!(!tx_budget_rejection_opens_circuit(
+            TxCircuitReason::UpdateRateExceeded
+        ));
+    }
+
+    #[test]
+    fn true_safety_reasons_still_open_hard_circuit() {
+        assert!(tx_budget_rejection_opens_circuit(
+            TxCircuitReason::ConsecutiveFailures
+        ));
+        assert!(tx_budget_rejection_opens_circuit(
+            TxCircuitReason::PriorityFeeSamplingFailures
+        ));
     }
 
     #[test]
