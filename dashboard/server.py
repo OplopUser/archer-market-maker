@@ -163,6 +163,28 @@ def classify_archer_live_status(metrics: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def parse_market_intel_payload(payload: Dict[str, Any], url: str) -> Dict[str, Any]:
+    signal = payload.get("signal") if isinstance(payload.get("signal"), dict) else payload
+    recommendation = signal.get("recommendation") or {}
+    return {
+        "enabled": True,
+        "ok": True,
+        "url": url,
+        "consumer": payload.get("consumer"),
+        "allowed_source_set": payload.get("allowed_source_set") or [],
+        "excluded_source_set": payload.get("excluded_source_set") or [],
+        "mode": signal.get("mode"),
+        "quote_enabled": recommendation.get("quote_enabled"),
+        "fair_value": recommendation.get("fair_value"),
+        "spread_add_bps": recommendation.get("spread_add_bps"),
+        "size_multiplier": recommendation.get("size_multiplier"),
+        "bid_size_multiplier": recommendation.get("bid_size_multiplier"),
+        "ask_size_multiplier": recommendation.get("ask_size_multiplier"),
+        "summary": signal.get("summary"),
+        "reasons": recommendation.get("reasons") or [],
+    }
+
+
 def run_cmd(args: List[str], timeout: float = 8.0) -> Dict[str, Any]:
     try:
         proc = subprocess.run(
@@ -690,22 +712,8 @@ class DashboardState:
             return {"enabled": False, "ok": False, "url": None}
         try:
             with urllib.request.urlopen(url, timeout=DASHBOARD_RPC_TIMEOUT) as resp:
-                signal = json.loads(resp.read().decode("utf-8"))
-            recommendation = signal.get("recommendation") or {}
-            return {
-                "enabled": True,
-                "ok": True,
-                "url": url,
-                "mode": signal.get("mode"),
-                "quote_enabled": recommendation.get("quote_enabled"),
-                "fair_value": recommendation.get("fair_value"),
-                "spread_add_bps": recommendation.get("spread_add_bps"),
-                "size_multiplier": recommendation.get("size_multiplier"),
-                "bid_size_multiplier": recommendation.get("bid_size_multiplier"),
-                "ask_size_multiplier": recommendation.get("ask_size_multiplier"),
-                "summary": recommendation.get("summary"),
-                "reasons": recommendation.get("reasons") or [],
-            }
+                payload = json.loads(resp.read().decode("utf-8"))
+            return parse_market_intel_payload(payload, url)
         except Exception as exc:  # noqa: BLE001 - dashboard exposes health as data.
             return {
                 "enabled": True,

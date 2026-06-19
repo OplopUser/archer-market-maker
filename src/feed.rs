@@ -74,6 +74,7 @@ fn bounded_multiplier(value: Option<f64>, fallback: f64) -> f64 {
 }
 
 fn market_intel_price(signal: &Value) -> Option<f64> {
+    let signal = market_intel_signal_payload(signal);
     [
         "/recommendation/fair_value",
         "/reference/price",
@@ -83,6 +84,13 @@ fn market_intel_price(signal: &Value) -> Option<f64> {
     ]
     .iter()
     .find_map(|path| json_positive_f64_at(signal, path))
+}
+
+fn market_intel_signal_payload(response: &Value) -> &Value {
+    response
+        .get("signal")
+        .filter(|signal| signal.is_object())
+        .unwrap_or(response)
 }
 
 async fn run_market_intel_feed(
@@ -124,10 +132,11 @@ async fn run_market_intel_feed(
         .await;
 
         match result {
-            Ok(signal) => {
+            Ok(response) => {
+                let signal = market_intel_signal_payload(&response);
                 let quote_enabled =
-                    json_bool_at(&signal, "/recommendation/quote_enabled").unwrap_or(true);
-                let mode = json_str_at(&signal, "/mode").unwrap_or("unknown");
+                    json_bool_at(signal, "/recommendation/quote_enabled").unwrap_or(true);
+                let mode = json_str_at(signal, "/mode").unwrap_or("unknown");
                 if !quote_enabled || mode == "pause" {
                     failures = failures.saturating_add(1);
                     state.feed_alive.store(false, Relaxed);
@@ -138,31 +147,31 @@ async fn run_market_intel_feed(
                     if failures == 1 || failures % 30 == 0 {
                         tracing::warn!(mode, quote_enabled, "market-intel signal is not quoteable");
                     }
-                } else if let Some(price) = market_intel_price(&signal) {
+                } else if let Some(price) = market_intel_price(signal) {
                     handle_tick(&state, &mut vol_tracker, price, price);
                     state.intel_spread_add_bps.store(
-                        json_finite_f64_at(&signal, "/recommendation/spread_add_bps")
+                        json_finite_f64_at(signal, "/recommendation/spread_add_bps")
                             .filter(|v| v.is_finite())
                             .unwrap_or(0.0),
                         Relaxed,
                     );
                     state.intel_size_multiplier.store(
                         bounded_multiplier(
-                            json_finite_f64_at(&signal, "/recommendation/size_multiplier"),
+                            json_finite_f64_at(signal, "/recommendation/size_multiplier"),
                             1.0,
                         ),
                         Relaxed,
                     );
                     state.intel_bid_size_multiplier.store(
                         bounded_multiplier(
-                            json_finite_f64_at(&signal, "/recommendation/bid_size_multiplier"),
+                            json_finite_f64_at(signal, "/recommendation/bid_size_multiplier"),
                             1.0,
                         ),
                         Relaxed,
                     );
                     state.intel_ask_size_multiplier.store(
                         bounded_multiplier(
-                            json_finite_f64_at(&signal, "/recommendation/ask_size_multiplier"),
+                            json_finite_f64_at(signal, "/recommendation/ask_size_multiplier"),
                             1.0,
                         ),
                         Relaxed,
@@ -230,6 +239,26 @@ mod tests {
         assert_eq!(bounded_multiplier(Some(1.5), 1.0), 1.0);
         assert_eq!(bounded_multiplier(Some(0.45), 1.0), 0.45);
         assert_eq!(bounded_multiplier(None, 1.0), 1.0);
+    }
+
+    #[test]
+    fn market_intel_price_accepts_archer_scoped_signal_wrapper() {
+        let scoped = serde_json::json!({
+            "consumer": "archer",
+            "allowed_source_set": ["binance", "manifest"],
+            "signal": {
+                "mode": "normal",
+                "recommendation": {
+                    "quote_enabled": true,
+                    "fair_value": "81.42"
+                },
+                "reference": {
+                    "price": "81.40"
+                }
+            }
+        });
+
+        assert_eq!(market_intel_price(&scoped), Some(81.42));
     }
 }
 

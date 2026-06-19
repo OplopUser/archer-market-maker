@@ -407,6 +407,21 @@ fn validate_config(c: &MMConfig) -> Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_usdc_style_uses_archer_scoped_market_intel_signal() {
+        let config = load_config(Path::new("config/live-usdc-style-12h.toml")).unwrap();
+
+        assert_eq!(
+            config.feed.market_intel_signal_url.as_deref(),
+            Some("http://market-intel:8790/api/signals/scoped/archer/sol_usdc")
+        );
+    }
+}
+
 fn default_binance_ws() -> String {
     "wss://stream.binance.com:9443/ws".into()
 }

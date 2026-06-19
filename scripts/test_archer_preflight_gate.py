@@ -62,7 +62,7 @@ def healthy_metrics() -> dict:
             "enabled": True,
             "ok": True,
             "quote_enabled": True,
-            "url": "http://market-intel:8790/api/signals/sol_usdc",
+            "url": "http://market-intel:8790/api/signals/scoped/archer/sol_usdc",
             "fair_value": "80.1",
             "spread_add_bps": "12.0",
         },
