@@ -29,6 +29,8 @@ pub enum TxPriority {
 pub enum TxPurpose {
     Update,
     ClearBook,
+    RecoveryUpdate,
+    SafetyClearBook,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -39,14 +41,20 @@ pub enum TxCircuitReason {
     ConsecutiveFailures = 4,
     UpdateRateExceeded = 5,
     PriorityFeeSamplingFailures = 6,
+    RecoveryUpdateRateExceeded = 7,
+    SafetyClearBookRateExceeded = 8,
+    SafetyClearBookCooldown = 9,
 }
 
 #[derive(Debug, Clone)]
 pub struct TxBudgetConfig {
     pub max_tx_per_minute: u64,
     pub max_update_tx_per_10min: u64,
+    pub max_recovery_update_tx_per_10min: u64,
     pub max_clear_book_per_5min: u64,
+    pub max_safety_clear_book_per_5min: u64,
     pub min_clear_book_interval: Duration,
+    pub min_safety_clear_book_interval: Duration,
 }
 
 const BLOCKHASH_TTL: Duration = Duration::from_secs(2);
@@ -129,9 +137,12 @@ struct TxBudget {
     tx_count: u64,
     update_window_started: Instant,
     update_count: u64,
+    recovery_update_count: u64,
     clear_window_started: Instant,
     clear_count: u64,
+    safety_clear_count: u64,
     last_clear_sent: Option<Instant>,
+    last_safety_clear_sent: Option<Instant>,
 }
 
 impl Default for TxBudget {
@@ -142,9 +153,12 @@ impl Default for TxBudget {
             tx_count: 0,
             update_window_started: now,
             update_count: 0,
+            recovery_update_count: 0,
             clear_window_started: now,
             clear_count: 0,
+            safety_clear_count: 0,
             last_clear_sent: None,
+            last_safety_clear_sent: None,
         }
     }
 }
@@ -163,11 +177,14 @@ impl TxBudget {
         if now.duration_since(self.update_window_started) >= UPDATE_WINDOW {
             self.update_window_started = now;
             self.update_count = 0;
+            self.recovery_update_count = 0;
         }
         if now.duration_since(self.clear_window_started) >= CLEAR_BOOK_WINDOW {
             self.clear_window_started = now;
             self.clear_count = 0;
+            self.safety_clear_count = 0;
             self.last_clear_sent = None;
+            self.last_safety_clear_sent = None;
         }
 
         if self.tx_count >= config.max_tx_per_minute {
@@ -181,6 +198,13 @@ impl TxBudget {
             self.update_count += 1;
         }
 
+        if purpose == TxPurpose::RecoveryUpdate {
+            if self.recovery_update_count >= config.max_recovery_update_tx_per_10min {
+                return Err(TxCircuitReason::RecoveryUpdateRateExceeded);
+            }
+            self.recovery_update_count += 1;
+        }
+
         if purpose == TxPurpose::ClearBook {
             if let Some(last_clear) = self.last_clear_sent {
                 if now.duration_since(last_clear) < config.min_clear_book_interval {
@@ -192,6 +216,19 @@ impl TxBudget {
             }
             self.clear_count += 1;
             self.last_clear_sent = Some(now);
+        }
+
+        if purpose == TxPurpose::SafetyClearBook {
+            if let Some(last_clear) = self.last_safety_clear_sent {
+                if now.duration_since(last_clear) < config.min_safety_clear_book_interval {
+                    return Err(TxCircuitReason::SafetyClearBookCooldown);
+                }
+            }
+            if self.safety_clear_count >= config.max_safety_clear_book_per_5min {
+                return Err(TxCircuitReason::SafetyClearBookRateExceeded);
+            }
+            self.safety_clear_count += 1;
+            self.last_safety_clear_sent = Some(now);
         }
 
         self.tx_count += 1;
@@ -266,8 +303,15 @@ impl TxSender {
                 ?purpose,
                 max_tx_per_minute = self.budget_config.max_tx_per_minute,
                 max_update_tx_per_10min = self.budget_config.max_update_tx_per_10min,
+                max_recovery_update_tx_per_10min =
+                    self.budget_config.max_recovery_update_tx_per_10min,
                 max_clear_book_per_5min = self.budget_config.max_clear_book_per_5min,
+                max_safety_clear_book_per_5min = self.budget_config.max_safety_clear_book_per_5min,
                 min_clear_book_interval_ms = self.budget_config.min_clear_book_interval.as_millis(),
+                min_safety_clear_book_interval_ms = self
+                    .budget_config
+                    .min_safety_clear_book_interval
+                    .as_millis(),
                 "TX budget throttle; dropping transaction"
             );
             return;
@@ -318,6 +362,9 @@ fn tx_budget_rejection_opens_circuit(reason: TxCircuitReason) -> bool {
             | TxCircuitReason::ClearBookRateExceeded
             | TxCircuitReason::ClearBookCooldown
             | TxCircuitReason::UpdateRateExceeded
+            | TxCircuitReason::RecoveryUpdateRateExceeded
+            | TxCircuitReason::SafetyClearBookRateExceeded
+            | TxCircuitReason::SafetyClearBookCooldown
     )
 }
 
@@ -591,8 +638,11 @@ mod tests {
         TxBudgetConfig {
             max_tx_per_minute: 3,
             max_update_tx_per_10min: 2,
+            max_recovery_update_tx_per_10min: 2,
             max_clear_book_per_5min: 2,
+            max_safety_clear_book_per_5min: 2,
             min_clear_book_interval: Duration::from_secs(30),
+            min_safety_clear_book_interval: Duration::from_secs(5),
         }
     }
 
@@ -673,6 +723,84 @@ mod tests {
     }
 
     #[test]
+    fn recovery_update_budget_does_not_consume_normal_update_budget() {
+        let mut budget = TxBudget::default();
+        let config = TxBudgetConfig {
+            max_update_tx_per_10min: 1,
+            max_recovery_update_tx_per_10min: 2,
+            max_tx_per_minute: 5,
+            ..budget_config()
+        };
+        let now = Instant::now();
+
+        assert!(budget.reserve(now, TxPurpose::Update, &config).is_ok());
+        assert_eq!(
+            budget.reserve(now + Duration::from_secs(1), TxPurpose::Update, &config),
+            Err(TxCircuitReason::UpdateRateExceeded)
+        );
+        assert!(
+            budget
+                .reserve(
+                    now + Duration::from_secs(2),
+                    TxPurpose::RecoveryUpdate,
+                    &config
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn normal_update_budget_does_not_block_recovery_update() {
+        let mut budget = TxBudget::default();
+        let config = TxBudgetConfig {
+            max_update_tx_per_10min: 1,
+            max_recovery_update_tx_per_10min: 1,
+            max_tx_per_minute: 5,
+            ..budget_config()
+        };
+        let now = Instant::now();
+
+        assert!(budget.reserve(now, TxPurpose::Update, &config).is_ok());
+        assert!(
+            budget
+                .reserve(
+                    now + Duration::from_secs(1),
+                    TxPurpose::RecoveryUpdate,
+                    &config
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn safety_clear_book_budget_does_not_consume_normal_clear_budget() {
+        let mut budget = TxBudget::default();
+        let config = TxBudgetConfig {
+            max_tx_per_minute: 5,
+            max_clear_book_per_5min: 1,
+            max_safety_clear_book_per_5min: 2,
+            min_safety_clear_book_interval: Duration::from_secs(1),
+            ..budget_config()
+        };
+        let now = Instant::now();
+
+        assert!(budget.reserve(now, TxPurpose::ClearBook, &config).is_ok());
+        assert_eq!(
+            budget.reserve(now + Duration::from_secs(31), TxPurpose::ClearBook, &config),
+            Err(TxCircuitReason::ClearBookRateExceeded)
+        );
+        assert!(
+            budget
+                .reserve(
+                    now + Duration::from_secs(32),
+                    TxPurpose::SafetyClearBook,
+                    &config
+                )
+                .is_ok()
+        );
+    }
+
+    #[test]
     fn budget_rejections_are_soft_throttles_not_hard_circuits() {
         assert!(!tx_budget_rejection_opens_circuit(
             TxCircuitReason::TxRateExceeded
@@ -685,6 +813,15 @@ mod tests {
         ));
         assert!(!tx_budget_rejection_opens_circuit(
             TxCircuitReason::UpdateRateExceeded
+        ));
+        assert!(!tx_budget_rejection_opens_circuit(
+            TxCircuitReason::RecoveryUpdateRateExceeded
+        ));
+        assert!(!tx_budget_rejection_opens_circuit(
+            TxCircuitReason::SafetyClearBookRateExceeded
+        ));
+        assert!(!tx_budget_rejection_opens_circuit(
+            TxCircuitReason::SafetyClearBookCooldown
         ));
     }
 

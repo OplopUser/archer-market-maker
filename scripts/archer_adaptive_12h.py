@@ -13,6 +13,7 @@ import argparse
 import copy
 import datetime as dt
 import json
+import math
 import os
 import pathlib
 import shlex
@@ -56,11 +57,39 @@ QUOTE_REPAIR_ENTER_QUOTE_PCT = float(os.environ.get("ARCHER_QUOTE_REPAIR_ENTER_Q
 QUOTE_REPAIR_EXIT_QUOTE_PCT = float(os.environ.get("ARCHER_QUOTE_REPAIR_EXIT_QUOTE_PCT", "0.62"))
 MAX_REPAIR_SECONDS = int(os.environ.get("ARCHER_MAX_REPAIR_SECONDS", "5400"))
 FEE_GUARD_MIN_SECONDS = int(os.environ.get("ARCHER_FEE_GUARD_MIN_SECONDS", "1800"))
+FEE_GUARD_DISCOVERY_MIN_SECONDS = int(os.environ.get("ARCHER_FEE_GUARD_DISCOVERY_MIN_SECONDS", "300"))
+FEE_GUARD_MAX_DURATION_SECONDS = int(
+    float(os.environ.get("ARCHER_MAX_FEE_GUARD_DURATION_MINUTES", "120")) * 60
+)
+MIN_FILLS_FOR_EDGE_EVALUATION = int(os.environ.get("ARCHER_MIN_FILLS_FOR_EDGE_EVALUATION", "3"))
+IDLE_EXPLORATION_AFTER_SECONDS = int(os.environ.get("ARCHER_IDLE_EXPLORATION_AFTER_SECS", "3600"))
 WATCHDOG_SECONDS = int(os.environ.get("ARCHER_WATCHDOG_SECONDS", "30"))
 WATCHDOG_STALE_STOP = int(os.environ.get("ARCHER_WATCHDOG_STALE_STOP", "2"))
 WATCHDOG_RPC429_STOP = int(os.environ.get("ARCHER_WATCHDOG_RPC429_STOP", "6"))
 WATCHDOG_FAILED_STOP = int(os.environ.get("ARCHER_WATCHDOG_FAILED_STOP", "5"))
 WATCHDOG_TX_STOP = int(os.environ.get("ARCHER_WATCHDOG_TX_STOP", "80"))
+STALENESS_CLEAR_STRIKES = int(os.environ.get("ARCHER_STALENESS_CLEAR_STRIKES", "3"))
+STALENESS_BACKOFF_SECONDS = [5, 10]
+STALENESS_CLEAR_COOLDOWN_SECONDS = int(os.environ.get("ARCHER_STALENESS_CLEAR_COOLDOWN_SECS", "300"))
+COMPOSE_STOP_PLACEHOLDER_RUN_ID = "__compose_stop_placeholder__"
+APPROVED_CAPPED_PROFILES = {
+    "resting_low_churn_16_30",
+    "fill_discovery_capped",
+    "overnight_selective_edge_probe",
+    "defensive_35_55",
+}
+SAFETY_FALLBACK_PROFILES = {
+    "fee_guard_passive_80",
+    "inventory_unwind_ask_only",
+    "overnight_inventory_repair",
+    "overnight_quote_repair_bid_bias",
+}
+PROFILE_APPROVAL_ENV = "ARCHER_APPROVED_SCALE_PROFILES"
+ALLOW_ALL_SCALE_PROFILES_ENV = "ARCHER_ALLOW_SCALE_PROFILES"
+PROFILE_APPROVAL_FALLBACK = os.environ.get(
+    "ARCHER_PROFILE_APPROVAL_FALLBACK",
+    "overnight_selective_edge_probe",
+)
 
 
 PROFIT_GUARD_DEFAULTS: Dict[str, Any] = {
@@ -68,12 +97,12 @@ PROFIT_GUARD_DEFAULTS: Dict[str, Any] = {
     "max_intel_spread_add_bps": 80.0,
     "max_intel_spread_tighten_bps": 0.0,
     "max_intel_side_spread_add_bps": 40.0,
-    "min_effective_spread_bps": 62.0,
+    "min_effective_spread_bps": 0.0,
     "min_net_edge_bps": 0.0,
     "toxicity_buffer_bps": 0.0,
     "min_intel_size_multiplier": 0.20,
     "post_fill_cooldown_ms": 900000,
-    "post_fill_side_size_multiplier": 0.0,
+    "post_fill_side_size_multiplier": 0.35,
     "post_fill_markout_check_ms": 900000,
     "post_fill_adverse_markout_bps": 12.0,
     "post_fill_adverse_cooldown_ms": 3600000,
@@ -84,6 +113,41 @@ FILL_TOXICITY_MIN_NOTIONAL = float(os.environ.get("ARCHER_FILL_TOXICITY_MIN_NOTI
 FILL_TOXICITY_MIN_LOSS_USDC = float(os.environ.get("ARCHER_FILL_TOXICITY_MIN_LOSS_USDC", "0.025"))
 FILL_TOXICITY_FLOOR_BUFFER_BPS = float(os.environ.get("ARCHER_FILL_TOXICITY_FLOOR_BUFFER_BPS", "8.0"))
 FILL_TOXICITY_STOP_FLOOR_BPS = float(os.environ.get("ARCHER_FILL_TOXICITY_STOP_FLOOR_BPS", "95.0"))
+WINNER_TRAILING_DRAWDOWN_USDC = float(os.environ.get("ARCHER_WINNER_TRAILING_DRAWDOWN_USDC", "0.05"))
+WINNER_NEGATIVE_NET_USDC = float(os.environ.get("ARCHER_WINNER_NEGATIVE_NET_USDC", "0.0"))
+WINNER_NEGATIVE_WINDOW_LOSS_USDC = float(os.environ.get("ARCHER_WINNER_NEGATIVE_WINDOW_LOSS_USDC", "0.025"))
+WINNER_MIN_FILL_NOTIONAL_USDC = float(os.environ.get("ARCHER_WINNER_MIN_FILL_NOTIONAL_USDC", "8.0"))
+WINNER_MIN_SIDE_SIZE_MULTIPLIER = float(os.environ.get("ARCHER_WINNER_MIN_SIDE_SIZE_MULTIPLIER", "0.05"))
+
+
+def optional_float(value: Any) -> Optional[float]:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    return result if math.isfinite(result) else None
+
+
+def market_intel_source_quality_failure(source_quality: Any) -> Optional[str]:
+    if isinstance(source_quality, dict):
+        source_status = str(source_quality.get("status") or "").lower()
+        if source_status not in {"ok", "fresh", "clean", "healthy"} or source_quality.get("stale") is True:
+            return f"market-intel source freshness is {source_status or 'unknown'}"
+        return None
+
+    if isinstance(source_quality, list) and source_quality:
+        for source in source_quality:
+            freshness = str(source.get("freshness_status") or source.get("status") or "").lower()
+            quality = str(source.get("quality_status") or source.get("quality") or "").lower()
+            if freshness not in {"fresh", "ok", "clean", "healthy"}:
+                name = source.get("source") or "unknown"
+                return f"market-intel source {name} freshness is {freshness or 'unknown'}"
+            if quality not in {"healthy", "ok", "fresh", "clean"}:
+                name = source.get("source") or "unknown"
+                return f"market-intel source {name} quality is {quality or 'unknown'}"
+        return None
+
+    return "market-intel source freshness is missing"
 
 
 PROFILES: Dict[str, Dict[str, Any]] = {
@@ -118,10 +182,10 @@ PROFILES: Dict[str, Dict[str, Any]] = {
         "max_intel_spread_add_bps": 80.0,
         "max_intel_spread_tighten_bps": 0.0,
         "max_intel_side_spread_add_bps": 40.0,
-        "min_effective_spread_bps": 62.0,
+        "min_effective_spread_bps": 24.0,
         "min_intel_size_multiplier": 0.20,
         "post_fill_cooldown_ms": 900000,
-        "post_fill_side_size_multiplier": 0.0,
+        "post_fill_side_size_multiplier": 0.35,
         "post_fill_markout_check_ms": 900000,
         "post_fill_adverse_markout_bps": 12.0,
         "post_fill_adverse_cooldown_ms": 3600000,
@@ -151,7 +215,7 @@ PROFILES: Dict[str, Dict[str, Any]] = {
         "toxicity_buffer_bps": 16.0,
         "min_intel_size_multiplier": 0.20,
         "post_fill_cooldown_ms": 900000,
-        "post_fill_side_size_multiplier": 0.0,
+        "post_fill_side_size_multiplier": 0.35,
         "post_fill_markout_check_ms": 900000,
         "post_fill_adverse_markout_bps": 12.0,
         "post_fill_adverse_cooldown_ms": 3600000,
@@ -209,13 +273,13 @@ PROFILES: Dict[str, Dict[str, Any]] = {
         "min_mid_update_ticks": 220,
     },
     "resting_low_churn_16_30": {
-        "description": "Fee guard: keep quotes live but slow repricing when no fills justify churn.",
-        "spread_levels_bps": [16.0, 30.0],
+        "description": "Active fill baseline: tighter capped quotes with slow repricing when no fills justify churn.",
+        "spread_levels_bps": [16.0, 24.0, 36.0],
         "inventory_pct": 20.0,
-        "max_quote_notional_per_level": 12.0,
+        "max_quote_notional_per_level": 10.0,
         "max_total_quote_notional": 60.0,
-        "min_quote_notional": 6.0,
-        "min_base_reserve_pct": 30.0,
+        "min_quote_notional": 1.0,
+        "min_base_reserve_pct": 65.0,
         "min_quote_reserve_pct": 30.0,
         "staleness_timeout_ms": 20000,
         "heartbeat_interval_ms": 1000,
@@ -242,13 +306,43 @@ PROFILES: Dict[str, Dict[str, Any]] = {
         "inventory_pct": 20.0,
         "max_quote_notional_per_level": 10.0,
         "max_total_quote_notional": 20.0,
-        "min_quote_notional": 8.0,
+        "min_quote_notional": 1.5,
         "min_base_reserve_pct": 65.0,
         "min_quote_reserve_pct": 20.0,
+        "post_fill_side_size_multiplier": 0.75,
         "staleness_timeout_ms": 30000,
         "heartbeat_interval_ms": 1000,
         "min_mid_update_interval_ms": 900000,
         "min_mid_update_ticks": 1000,
+    },
+    "fill_discovery_capped": {
+        "description": "Bounded fill-discovery probe after clean no-fill fee guard evidence; tiny capped size and explicit edge budget.",
+        "spread_levels_bps": [22.0, 34.0],
+        "inventory_pct": 12.0,
+        "max_quote_notional_per_level": 8.0,
+        "max_total_quote_notional": 24.0,
+        "min_quote_notional": 1.5,
+        "min_base_reserve_pct": 55.0,
+        "min_quote_reserve_pct": 35.0,
+        "staleness_timeout_ms": 15000,
+        "vol_max_multiplier": 1.0,
+        "intel_spread_add_multiplier": 0.20,
+        "max_intel_spread_add_bps": 35.0,
+        "max_intel_spread_tighten_bps": 0.0,
+        "max_intel_side_spread_add_bps": 20.0,
+        "min_effective_spread_bps": 22.0,
+        "min_net_edge_bps": 6.0,
+        "toxicity_buffer_bps": 12.0,
+        "min_intel_size_multiplier": 0.35,
+        "post_fill_side_size_multiplier": 0.75,
+        "heartbeat_interval_ms": 1000,
+        "min_mid_update_interval_ms": 300000,
+        "min_mid_update_ticks": 320,
+        "min_full_refresh_interval_ms": 600000,
+        "max_update_tx_per_10min": 3,
+        "post_gate_max_break_even_bps": 34.0,
+        "post_gate_max_tx_per_hour": 8.0,
+        "forced_transition_trial_minutes": 30.0,
     },
     "inventory_unwind_ask_only": {
         "description": "Loss guard: keep asks dominant but preserve a very wide minimal bid for maker-fee capture.",
@@ -315,6 +409,108 @@ def profile_validation_defaults(profile_name: str) -> Dict[str, float]:
     }
 
 
+def _env_csv_set(name: str) -> set[str]:
+    raw = os.environ.get(name, "")
+    return {item.strip() for item in raw.split(",") if item.strip()}
+
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def profile_approval_state(profile_name: str) -> Dict[str, Any]:
+    if profile_name not in PROFILES:
+        raise ValueError(f"unknown profile {profile_name}")
+
+    explicit = _env_csv_set(PROFILE_APPROVAL_ENV)
+    if _env_truthy(ALLOW_ALL_SCALE_PROFILES_ENV):
+        return {
+            "approved": True,
+            "profile": profile_name,
+            "source": ALLOW_ALL_SCALE_PROFILES_ENV,
+            "default_allowed": profile_name in APPROVED_CAPPED_PROFILES,
+            "explicitly_allowed": True,
+        }
+    if profile_name in explicit:
+        return {
+            "approved": True,
+            "profile": profile_name,
+            "source": PROFILE_APPROVAL_ENV,
+            "default_allowed": profile_name in APPROVED_CAPPED_PROFILES,
+            "explicitly_allowed": True,
+        }
+    if profile_name in APPROVED_CAPPED_PROFILES:
+        return {
+            "approved": True,
+            "profile": profile_name,
+            "source": "approved_capped_queue",
+            "default_allowed": True,
+            "explicitly_allowed": False,
+        }
+    if profile_name in SAFETY_FALLBACK_PROFILES:
+        return {
+            "approved": True,
+            "profile": profile_name,
+            "source": "safety_fallback",
+            "default_allowed": True,
+            "explicitly_allowed": False,
+        }
+    return {
+        "approved": False,
+        "profile": profile_name,
+        "source": "approval_required",
+        "default_allowed": False,
+        "explicitly_allowed": False,
+    }
+
+
+def resolve_profile_approval(
+    requested_profile: str,
+    reason: str,
+    *,
+    source: str,
+    fallback_profile: Optional[str] = None,
+) -> Tuple[str, str]:
+    state = profile_approval_state(requested_profile)
+    if state["approved"]:
+        return (
+            requested_profile,
+            f"{reason}; profile_approval=approved source={state['source']} "
+            f"requested_profile={requested_profile} effective_profile={requested_profile}",
+        )
+
+    fallback = fallback_profile or PROFILE_APPROVAL_FALLBACK
+    if fallback not in PROFILES or fallback == requested_profile:
+        fallback = "resting_low_churn_16_30"
+    fallback_state = profile_approval_state(fallback)
+    if not fallback_state["approved"]:
+        fallback = "resting_low_churn_16_30"
+
+    return (
+        fallback,
+        "profile_approval_denied: "
+        f"source={source}, requested_profile={requested_profile}, "
+        f"effective_profile={fallback}, required_env={PROFILE_APPROVAL_ENV}={requested_profile} "
+        f"or {ALLOW_ALL_SCALE_PROFILES_ENV}=true; {reason}",
+    )
+
+
+def validate_start_args(
+    run_id: str,
+    duration_seconds: int,
+    evaluation_seconds: int,
+    initial_profile: str,
+) -> None:
+    if run_id == COMPOSE_STOP_PLACEHOLDER_RUN_ID:
+        raise ValueError("refusing to start Archer with compose stop placeholder run id")
+    if duration_seconds <= 0:
+        raise ValueError("duration_seconds must be positive")
+    if evaluation_seconds <= 0:
+        raise ValueError("evaluation_seconds must be positive")
+    if initial_profile not in PROFILES:
+        raise ValueError(f"unknown initial profile {initial_profile}")
+
+
 class AdaptiveController:
     def __init__(
         self,
@@ -361,6 +557,9 @@ class AdaptiveController:
         self.initial_reason = initial_reason
         self.stop_requested = False
         self.profile_entered_at = time.time()
+        self.staleness_strikes = 0
+        self.last_staleness_clear_at = 0.0
+        self.winner_high_water_net: Optional[float] = None
 
     def write_controller_heartbeat(self, event: str, reason: Optional[str] = None) -> None:
         self.run_dir.mkdir(parents=True, exist_ok=True)
@@ -486,10 +685,14 @@ min_net_edge_bps = {float(profile.get('min_net_edge_bps', self.config_base['stra
 toxicity_buffer_bps = {float(profile.get('toxicity_buffer_bps', self.config_base['strategy'].get('toxicity_buffer_bps', 0.0))):.2f}
 min_intel_size_multiplier = {float(profile.get('min_intel_size_multiplier', self.config_base['strategy'].get('min_intel_size_multiplier', 0.20))):.2f}
 post_fill_cooldown_ms = {int(profile.get('post_fill_cooldown_ms', self.config_base['strategy'].get('post_fill_cooldown_ms', 900000)))}
-post_fill_side_size_multiplier = {float(profile.get('post_fill_side_size_multiplier', self.config_base['strategy'].get('post_fill_side_size_multiplier', 0.0))):.2f}
+post_fill_side_size_multiplier = {float(profile.get('post_fill_side_size_multiplier', self.config_base['strategy'].get('post_fill_side_size_multiplier', 0.35))):.2f}
 post_fill_markout_check_ms = {int(profile.get('post_fill_markout_check_ms', self.config_base['strategy'].get('post_fill_markout_check_ms', 900000)))}
 post_fill_adverse_markout_bps = {float(profile.get('post_fill_adverse_markout_bps', self.config_base['strategy'].get('post_fill_adverse_markout_bps', 12.0))):.2f}
 post_fill_adverse_cooldown_ms = {int(profile.get('post_fill_adverse_cooldown_ms', self.config_base['strategy'].get('post_fill_adverse_cooldown_ms', 3600000)))}
+max_fee_guard_duration_minutes = {FEE_GUARD_MAX_DURATION_SECONDS / 60:.1f}
+min_fills_for_edge_evaluation = {MIN_FILLS_FOR_EDGE_EVALUATION}
+idle_exploration_after_secs = {IDLE_EXPLORATION_AFTER_SECONDS}
+forced_transition_trial_minutes = {float(profile.get('forced_transition_trial_minutes', 0.0)):.1f}
 
 [risk]
 min_quote_notional = {profile['min_quote_notional']:.1f}
@@ -511,10 +714,14 @@ maker_book_poll_interval_ms = {int(execution.get('maker_book_poll_interval_ms', 
 min_mid_update_interval_ms = {int(profile['min_mid_update_interval_ms'])}
 min_mid_update_ticks = {int(profile['min_mid_update_ticks'])}
 min_full_refresh_interval_ms = {int(profile.get('min_full_refresh_interval_ms', execution.get('min_full_refresh_interval_ms', 600000)))}
+min_empty_side_recovery_interval_ms = {int(profile.get('min_empty_side_recovery_interval_ms', execution.get('min_empty_side_recovery_interval_ms', 60000)))}
 max_tx_per_minute = {int(execution.get('max_tx_per_minute', 20))}
 max_update_tx_per_10min = {int(profile.get('max_update_tx_per_10min', execution.get('max_update_tx_per_10min', 6)))}
+max_recovery_update_tx_per_10min = {int(profile.get('max_recovery_update_tx_per_10min', execution.get('max_recovery_update_tx_per_10min', 4)))}
 max_clear_book_per_5min = {int(execution.get('max_clear_book_per_5min', 2))}
+max_safety_clear_book_per_5min = {int(execution.get('max_safety_clear_book_per_5min', 4))}
 min_clear_book_interval_ms = {int(execution.get('min_clear_book_interval_ms', 30000))}
+min_safety_clear_book_interval_ms = {int(execution.get('min_safety_clear_book_interval_ms', 10000))}
 shadow_mode = true
 
 [monitoring]
@@ -530,6 +737,7 @@ log_level = "{monitoring.get('log_level', 'info')}"
                     "description": profile["description"],
                     "config_path": str(ACTIVE_CONFIG),
                     "settings": profile,
+                    "profile_approval": profile_approval_state(profile_name),
                 },
                 indent=2,
                 sort_keys=True,
@@ -559,14 +767,122 @@ log_level = "{monitoring.get('log_level', 'info')}"
         with self.ledger_md.open("a") as fh:
             fh.write(f"- {entry['time']} | {event} | profile={profile} | changed={changed} | {reason}\n")
 
+    def after_cost_attribution(self, metrics: Dict[str, Any]) -> Dict[str, Any]:
+        pnl = metrics.get("pnl", {})
+        tx = metrics.get("transactions", {})
+        profile = PROFILES.get(self.current_profile, {})
+        fill_notional = abs(float(pnl.get("quote_delta") or 0.0))
+        quote_notional = max(float(profile.get("max_total_quote_notional") or 0.0), 1.0)
+        evidence_notional = fill_notional if fill_notional > 0.0 else quote_notional
+        fee_usdc = float(pnl.get("fee_usdc") or 0.0)
+        net = float(pnl.get("net_trading_vs_hold_usdc") or 0.0)
+        trading = float(pnl.get("trading_vs_hold_usdc") or 0.0)
+        failed = int(tx.get("failed_count") or 0)
+        break_even_spread_bps = fee_usdc / evidence_notional * 10_000.0
+        after_cost_edge_bps = net / evidence_notional * 10_000.0
+        gross_edge_bps = trading / evidence_notional * 10_000.0
+        failed_tx_cost_bps = failed * 0.001 / evidence_notional * 10_000.0
+        return {
+            "fill_notional_usdc": fill_notional,
+            "evidence_notional_usdc": evidence_notional,
+            "break_even_spread_bps": break_even_spread_bps,
+            "after_cost_edge_bps": after_cost_edge_bps,
+            "gross_edge_bps": gross_edge_bps,
+            "failed_tx_cost_bps": failed_tx_cost_bps,
+        }
+
+    def no_fill_attribution(
+        self,
+        metrics: Dict[str, Any],
+        *,
+        live_status: Optional[Dict[str, Any]] = None,
+        current_window_fill: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        pnl = metrics.get("pnl", {})
+        status = metrics.get("status", {})
+        market_intel = metrics.get("market_intel", {})
+        if live_status is None:
+            live_status = metrics.get("archer_live_status")
+            if not isinstance(live_status, dict) or "action" not in live_status:
+                live_status = classify_archer_live_status(metrics)
+
+        bid_levels = int(status.get("bid_levels") or 0)
+        ask_levels = int(status.get("ask_levels") or 0)
+        fill_detected = bool(pnl.get("fill_detected")) if current_window_fill is None else current_window_fill
+        reason = "unknown"
+        if fill_detected:
+            reason = "filled"
+        elif live_status.get("action") not in {None, "continue"}:
+            reason = "stale_or_guarded"
+        elif market_intel.get("ok") is False or market_intel.get("quote_enabled") is False:
+            reason = "stale_or_guarded"
+        elif bid_levels == 0 or ask_levels == 0:
+            reason = "side_missing"
+        elif self.current_profile == "fee_guard_passive_80":
+            reason = "fee_guard_no_edge"
+        elif self.estimated_tightest_spread_bps(metrics) >= 70.0:
+            reason = "too_wide"
+        elif float(PROFILES.get(self.current_profile, {}).get("max_total_quote_notional") or 0.0) <= 24.0:
+            reason = "size_too_small"
+        return {
+            "quote_time_profile": self.current_profile,
+            "quote_time_bid_levels": bid_levels,
+            "quote_time_ask_levels": ask_levels,
+            "quote_time_intel_mode": market_intel.get("mode"),
+            "quote_time_spread_bps": self.estimated_tightest_spread_bps(metrics),
+            "no_fill_reason": reason,
+        }
+
+    def parent_child_attribution(self, metrics: Dict[str, Any], no_fill: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
+        market_intel = metrics.get("market_intel", {})
+        if not isinstance(market_intel, dict):
+            market_intel = {}
+        parent_mode = str(market_intel.get("parent_cluster_mode") or "").lower()
+        intel_mode = str(market_intel.get("mode") or "").lower()
+        if no_fill is None:
+            no_fill = self.no_fill_attribution(metrics)
+        no_fill_reason = str(no_fill.get("no_fill_reason") or "unknown")
+        if parent_mode == "normal" and self.current_profile == "fee_guard_passive_80":
+            return {
+                "parent_child_attribution": "parent_normal_local_fee_guard",
+                "parent_child_deviation_reason": (
+                    "parent normal; Archer local fee/no-fill guard is driving passive profile"
+                ),
+            }
+        if parent_mode == "normal" and no_fill_reason not in {"filled", "unknown"}:
+            return {
+                "parent_child_attribution": f"parent_normal_local_{no_fill_reason}",
+                "parent_child_deviation_reason": f"parent normal; Archer local {no_fill_reason} condition is driving behavior",
+            }
+        if parent_mode and parent_mode not in {"normal"}:
+            return {
+                "parent_child_attribution": "parent_cluster_guard",
+                "parent_child_deviation_reason": f"parent cluster mode is {parent_mode}",
+            }
+        if intel_mode in {"pause", "reduce_only", "cautious"}:
+            return {
+                "parent_child_attribution": "child_market_intel_guard",
+                "parent_child_deviation_reason": f"child market-intel mode is {intel_mode}",
+            }
+        return {
+            "parent_child_attribution": "parent_child_aligned",
+            "parent_child_deviation_reason": "parent and Archer local controls are aligned",
+        }
+
     def compact_metrics(self, metrics: Dict[str, Any]) -> Dict[str, Any]:
         pnl = metrics.get("pnl", {})
         tx = metrics.get("transactions", {})
         status = metrics.get("status", {})
         market = metrics.get("market", {})
+        market_intel = metrics.get("market_intel", {})
         logs = metrics.get("logs", {}).get("counts", {})
-        live_status = metrics.get("archer_live_status") or classify_archer_live_status(metrics)
+        live_status = metrics.get("archer_live_status")
+        if not isinstance(live_status, dict) or "action" not in live_status:
+            live_status = classify_archer_live_status(metrics)
         alert = live_status.get("alert", {})
+        attribution = self.no_fill_attribution(metrics, live_status=live_status)
+        parent_attribution = self.parent_child_attribution(metrics, attribution)
+        after_cost = self.after_cost_attribution(metrics)
         return {
             "mid_price": metrics.get("mid_price"),
             "market_command_ok": market.get("command_ok"),
@@ -585,6 +901,9 @@ log_level = "{monitoring.get('log_level', 'info')}"
             "base_delta": pnl.get("base_delta"),
             "quote_delta": pnl.get("quote_delta"),
             "fill_detected": pnl.get("fill_detected"),
+            "seconds_since_last_fill": pnl.get("seconds_since_last_fill"),
+            "fills_this_window": pnl.get("fills_this_window"),
+            "total_fills": pnl.get("total_fills"),
             "trading_vs_hold_usdc": pnl.get("trading_vs_hold_usdc"),
             "net_trading_vs_hold_usdc": pnl.get("net_trading_vs_hold_usdc"),
             "fee_usdc": pnl.get("fee_usdc"),
@@ -595,6 +914,19 @@ log_level = "{monitoring.get('log_level', 'info')}"
             "price_feed_stale": logs.get("price_feed_stale"),
             "tx_circuit_breaker": logs.get("tx_circuit_breaker"),
             "rpc_429": logs.get("rpc_429"),
+            "forced_transition_remaining_trial_minutes": metrics.get("strategy", {}).get(
+                "forced_transition_remaining_trial_minutes"
+            ),
+            "parent_cluster_id": market_intel.get("parent_cluster_id"),
+            "parent_cluster_mode": market_intel.get("parent_cluster_mode"),
+            "parent_cluster_child_markets": market_intel.get("parent_cluster_child_markets") or [],
+            "parent_cluster_child_venues": market_intel.get("parent_cluster_child_venues") or [],
+            "parent_cluster_base_pyth_conf_bps": market_intel.get("parent_cluster_base_pyth_conf_bps"),
+            "parent_cluster_hedge_status": market_intel.get("parent_cluster_hedge_status"),
+            "parent_cluster_reason_codes": market_intel.get("parent_cluster_reason_codes") or [],
+            **parent_attribution,
+            **attribution,
+            **after_cost,
         }
 
     def stop_screen(self, name: str) -> None:
@@ -790,7 +1122,251 @@ log_level = "{monitoring.get('log_level', 'info')}"
             return "fee_guard_passive_80", reason + "; switching to passive 80bps guard"
         return None
 
+    def discovery_gates_clean(
+        self,
+        metrics: Dict[str, Any],
+        *,
+        live_status: Dict[str, Any],
+        window_stale: int,
+        window_rpc_429: int,
+        window_failed: int,
+    ) -> Tuple[bool, str]:
+        status = metrics.get("status", {})
+        dashboard_health = metrics.get("dashboard_health", {})
+        market_intel = metrics.get("market_intel", {})
+        if live_status.get("action") != "continue":
+            return False, f"live action is {live_status.get('action')}"
+        if dashboard_health.get("ok") is not True or dashboard_health.get("stale") is True:
+            return False, "dashboard health is not fresh"
+        if status.get("command_ok") is not True or status.get("stale") is True:
+            return False, "dashboard status readback is not fresh"
+        if live_status.get("rpc_healthy") is not True or live_status.get("rpc_stale") is True:
+            return False, "direct RPC readback is not fresh"
+        if live_status.get("heartbeat_healthy") is not True:
+            return False, "controller heartbeat is not healthy"
+        if window_stale > 0 or window_rpc_429 > 0 or window_failed > 0:
+            return (
+                False,
+                f"recent error delta present: stale={window_stale}, rpc_429={window_rpc_429}, failed={window_failed}",
+            )
+        if market_intel.get("ok") is not True or market_intel.get("quote_enabled") is not True:
+            return False, "market-intel is not ok or has disabled quoting"
+        if str(market_intel.get("mode") or "").lower() == "pause":
+            return False, "market-intel mode is pause"
+        fair_value = float(market_intel.get("fair_value") or 0.0)
+        if not math.isfinite(fair_value) or fair_value <= 0.0:
+            return False, "market-intel fair value is invalid"
+        source_quality_failure = market_intel_source_quality_failure(market_intel.get("source_quality"))
+        if source_quality_failure:
+            return False, source_quality_failure
+        generated_at = market_intel.get("generated_at_unix_secs")
+        if generated_at is not None:
+            try:
+                age_secs = time.time() - float(generated_at)
+            except (TypeError, ValueError):
+                return False, "market-intel source freshness timestamp is invalid"
+            if age_secs > 45.0:
+                return False, f"market-intel source freshness age is {age_secs:.0f}s"
+        return True, "clean"
+
+    def no_edge_fee_guard_decision(
+        self,
+        metrics: Dict[str, Any],
+        *,
+        live_status: Dict[str, Any],
+        profile_age: float,
+        hour_index: int,
+        window_fill: bool,
+        window_stale: int,
+        window_rpc_429: int,
+        window_failed: int,
+    ) -> Optional[Tuple[str, str]]:
+        pnl = metrics.get("pnl", {})
+        tx = metrics.get("transactions", {})
+        if self.current_profile != "fee_guard_passive_80" or window_fill:
+            return None
+        if profile_age < FEE_GUARD_DISCOVERY_MIN_SECONDS and hour_index < 1:
+            return None
+
+        after_cost = self.after_cost_attribution(metrics)
+        no_fill = self.no_fill_attribution(
+            metrics,
+            live_status=live_status,
+            current_window_fill=window_fill,
+        )
+        net = float(pnl.get("net_trading_vs_hold_usdc") or 0.0)
+        tx_count = int(tx.get("since_start_count") or 0)
+        total_fills = int(pnl.get("total_fills") or 0)
+        seconds_since_last_fill = pnl.get("seconds_since_last_fill")
+        try:
+            seconds_since_last_fill_f = float(seconds_since_last_fill)
+        except (TypeError, ValueError):
+            seconds_since_last_fill_f = profile_age if not bool(pnl.get("fill_detected")) else 0.0
+        idle_ready = seconds_since_last_fill_f >= IDLE_EXPLORATION_AFTER_SECONDS
+        timeout_escape = total_fills == 0 and profile_age >= FEE_GUARD_MAX_DURATION_SECONDS
+        if not timeout_escape and not idle_ready and total_fills < MIN_FILLS_FOR_EDGE_EVALUATION:
+            return None
+        no_edge = net <= 0.02 or after_cost["after_cost_edge_bps"] <= 2.0
+        enough_exposure = (
+            tx_count >= 1
+            or profile_age >= FEE_GUARD_DISCOVERY_MIN_SECONDS
+            or hour_index >= 1
+        )
+        if not no_edge or not enough_exposure:
+            return None
+
+        gates_clean, gate_reason = self.discovery_gates_clean(
+            metrics,
+            live_status=live_status,
+            window_stale=window_stale,
+            window_rpc_429=window_rpc_429,
+            window_failed=window_failed,
+        )
+        reason = (
+            "no-edge fee guard: "
+            f"no_fill_reason={no_fill['no_fill_reason']}, "
+            f"quote_time_spread={no_fill['quote_time_spread_bps']:.1f}bps, "
+            f"break_even={after_cost['break_even_spread_bps']:.1f}bps, "
+            f"after_cost_edge={after_cost['after_cost_edge_bps']:.1f}bps, "
+            f"tx_count={tx_count}, age={int(profile_age)}s"
+        )
+        if str(metrics.get("market_intel", {}).get("parent_cluster_mode") or "").lower() == "normal":
+            reason += "; parent_normal_local_no_fill"
+        if gates_clean:
+            if timeout_escape:
+                reason = "no_fill_timeout_escape: " + reason
+            return (
+                "fill_discovery_capped",
+                reason + "; entering bounded fill discovery",
+            )
+        return (
+            "__stop__",
+            reason + f"; discovery unsafe, stopping/shadowing instead: {gate_reason}",
+        )
+
+    def resting_low_churn_idle_decision(
+        self,
+        metrics: Dict[str, Any],
+        *,
+        live_status: Dict[str, Any],
+        profile_age: float,
+        window_fill: bool,
+        window_stale: int,
+        window_rpc_429: int,
+        window_failed: int,
+    ) -> Optional[Tuple[str, str]]:
+        if self.current_profile != "resting_low_churn_16_30" or window_fill:
+            return None
+
+        pnl = metrics.get("pnl", {})
+        try:
+            fills_this_window = int(pnl.get("fills_this_window") or 0)
+        except (TypeError, ValueError):
+            fills_this_window = 0
+        if fills_this_window > 0:
+            return None
+
+        try:
+            total_fills = int(pnl.get("total_fills") or 0)
+        except (TypeError, ValueError):
+            total_fills = 0
+        if total_fills <= 0:
+            return None
+
+        try:
+            seconds_since_last_fill = float(pnl.get("seconds_since_last_fill"))
+        except (TypeError, ValueError):
+            return None
+        if seconds_since_last_fill < IDLE_EXPLORATION_AFTER_SECONDS:
+            return None
+
+        net = float(pnl.get("net_trading_vs_hold_usdc") or 0.0)
+        if net < -0.05:
+            return None
+
+        gates_clean, gate_reason = self.discovery_gates_clean(
+            metrics,
+            live_status=live_status,
+            window_stale=window_stale,
+            window_rpc_429=window_rpc_429,
+            window_failed=window_failed,
+        )
+        no_fill = self.no_fill_attribution(
+            metrics,
+            live_status=live_status,
+            current_window_fill=False,
+        )
+        reason = (
+            "resting_low_churn_idle_escape: "
+            f"seconds_since_last_fill={seconds_since_last_fill:.0f}, "
+            f"fills_this_window={fills_this_window}, total_fills={total_fills}, "
+            f"no_fill_reason={no_fill['no_fill_reason']}, "
+            f"quote_time_spread={no_fill['quote_time_spread_bps']:.1f}bps, "
+            f"age={int(profile_age)}s"
+        )
+        if not gates_clean:
+            return (
+                self.current_profile,
+                reason + f"; discovery gate blocked by {gate_reason}",
+            )
+        return (
+            "fill_discovery_capped",
+            reason + "; entering capped fill discovery",
+        )
+
+    def winner_profile_guard_decision(
+        self,
+        *,
+        net: float,
+        trading: float,
+        prev_net: float,
+        window_net: float,
+        window_fill: bool,
+        window_quote_delta: float,
+    ) -> Optional[Tuple[str, str]]:
+        if self.current_profile != "winner_scale_24_40":
+            self.winner_high_water_net = None
+            return None
+
+        starting_high_water = prev_net if self.winner_high_water_net is None else self.winner_high_water_net
+        self.winner_high_water_net = max(starting_high_water, net)
+        trailing_drawdown = self.winner_high_water_net - net
+        fill_notional = abs(window_quote_delta)
+        min_fill_notional = max(
+            WINNER_MIN_FILL_NOTIONAL_USDC,
+            float(PROFILES["winner_scale_24_40"].get("min_quote_notional") or 0.0)
+            * WINNER_MIN_SIDE_SIZE_MULTIPLIER,
+        )
+        material_fill_window = window_fill and fill_notional >= min_fill_notional
+        negative_fill_window = material_fill_window and window_net <= -WINNER_NEGATIVE_WINDOW_LOSS_USDC
+        trailing_loss = (
+            self.winner_high_water_net > 0.0
+            and trailing_drawdown >= WINNER_TRAILING_DRAWDOWN_USDC
+        )
+        net_edge_nonpositive = material_fill_window and net <= WINNER_NEGATIVE_NET_USDC
+        if not (net_edge_nonpositive or negative_fill_window or trailing_loss):
+            return None
+
+        target = "fee_guard_passive_80" if net_edge_nonpositive else "resting_low_churn_16_30"
+        reasons = []
+        if net_edge_nonpositive:
+            reasons.append("net_edge_nonpositive")
+        if negative_fill_window:
+            reasons.append("negative_fill_window")
+        if trailing_loss:
+            reasons.append("trailing_drawdown")
+        return (
+            target,
+            "winner profile performance guard: "
+            f"reasons={','.join(reasons)}, "
+            f"net_vs_hold=${net:.3f}, trading_vs_hold=${trading:.3f}, "
+            f"high_water=${self.winner_high_water_net:.3f}, "
+            f"trailing_drawdown=${trailing_drawdown:.3f}, "
+            f"window_net=${window_net:.3f}, fill_notional=${fill_notional:.2f}",
+        )
+
     def decide_next_profile(self, metrics: Dict[str, Any], previous: Optional[Dict[str, Any]], hour_index: int) -> Tuple[str, str]:
+        has_previous = previous is not None
         pnl = metrics.get("pnl", {})
         tx = metrics.get("transactions", {})
         logs = metrics.get("logs", {}).get("counts", {})
@@ -805,11 +1381,13 @@ log_level = "{monitoring.get('log_level', 'info')}"
         rpc_429 = int(logs.get("rpc_429") or 0)
         status = metrics.get("status", {})
         market = metrics.get("market", {})
-        live_status = metrics.get("archer_live_status") or classify_archer_live_status(metrics)
+        live_status = metrics.get("archer_live_status")
+        if not isinstance(live_status, dict) or "action" not in live_status:
+            live_status = classify_archer_live_status(metrics)
         live_action = live_status.get("action")
         live_alert = live_status.get("alert", {})
 
-        if live_action in {"clear_book", "stop_supervised"}:
+        if live_action == "stop_supervised":
             return (
                 "__stop__",
                 "live status failover action requires supervised stop: "
@@ -823,24 +1401,53 @@ log_level = "{monitoring.get('log_level', 'info')}"
                 f"status_error={status.get('command_error') or market.get('command_error')}",
             )
         if live_action == "quote_reduce_only":
+            prev_live_action = previous.get("live_action") if previous else None
+            prev_live_state = previous.get("live_state") if previous else None
+            prev_stale_for_quote_reduce = int(previous.get("price_feed_stale") or stale) if previous else stale
+            prev_rpc_429_for_quote_reduce = int(previous.get("rpc_429") or rpc_429) if previous else rpc_429
+            prev_failed_for_quote_reduce = int(previous.get("failed_count") or failed) if previous else failed
+            confirmed_quote_reduce = (
+                prev_live_action == "quote_reduce_only"
+                or prev_live_state == "rpc_stale_dashboard_healthy"
+                or max(0, stale - prev_stale_for_quote_reduce) >= 2
+                or max(0, rpc_429 - prev_rpc_429_for_quote_reduce) >= 3
+                or max(0, failed - prev_failed_for_quote_reduce) >= 2
+            )
+            if not confirmed_quote_reduce:
+                return (
+                    self.current_profile,
+                    "single live status failover action quote_reduce_only; "
+                    "holding current profile pending confirmation: "
+                    f"state={live_status.get('state')}, "
+                    f"restart_policy={live_status.get('restart_policy')}, "
+                    f"alert={live_alert.get('reason')}",
+                )
             return (
                 "fee_guard_passive_80",
-                "live status failover action quote_reduce_only: "
+                "confirmed live status failover action quote_reduce_only: "
                 f"state={live_status.get('state')}, "
                 f"restart_policy={live_status.get('restart_policy')}, "
                 f"alert={live_alert.get('reason')}",
             )
 
-        prev_fee = float(previous.get("fee_usdc") or 0.0) if previous else 0.0
+        prev_fee = float(previous.get("fee_usdc") or 0.0) if previous else fee_usdc
         window_fee = max(0.0, fee_usdc - prev_fee)
-        prev_net = float(previous.get("net_trading_vs_hold_usdc") or 0.0) if previous else 0.0
-        prev_trading = float(previous.get("trading_vs_hold_usdc") or 0.0) if previous else 0.0
-        prev_failed = int(previous.get("failed_count") or 0) if previous else 0
-        prev_tx_count = int(previous.get("tx_count") or 0) if previous else 0
-        prev_stale = int(previous.get("price_feed_stale") or 0) if previous else 0
-        prev_rpc_429 = int(previous.get("rpc_429") or 0) if previous else 0
-        prev_base_delta = float(previous.get("base_delta") or 0.0) if previous else 0.0
-        prev_quote_delta = float(previous.get("quote_delta") or 0.0) if previous else 0.0
+        prev_net = float(previous.get("net_trading_vs_hold_usdc") or 0.0) if previous else net
+        prev_trading = float(previous.get("trading_vs_hold_usdc") or 0.0) if previous else trading
+        prev_failed = int(previous.get("failed_count") or 0) if previous else failed
+        prev_tx_count = int(previous.get("tx_count") or 0) if previous else tx_count
+        prev_stale = int(previous.get("price_feed_stale") or 0) if previous else stale
+        prev_rpc_429 = int(previous.get("rpc_429") or 0) if previous else rpc_429
+        prev_base_delta = (
+            float(previous.get("base_delta") or 0.0)
+            if previous
+            else float(pnl.get("base_delta") or 0.0)
+        )
+        prev_quote_delta = (
+            float(previous.get("quote_delta") or 0.0)
+            if previous
+            else float(pnl.get("quote_delta") or 0.0)
+        )
         window_net = net - prev_net
         window_trading = trading - prev_trading
         window_quote_delta = float(pnl.get("quote_delta") or 0.0) - prev_quote_delta
@@ -862,7 +1469,7 @@ log_level = "{monitoring.get('log_level', 'info')}"
         base_pct = 1.0 - quote_pct if quote_pct is not None else None
         profile_age = time.time() - self.profile_entered_at
 
-        if window_stale >= 4 or window_rpc_429 >= 6 or window_failed >= 5:
+        if window_rpc_429 >= 6 or window_failed >= 5:
             return (
                 "__stop__",
                 "runaway error guard: "
@@ -885,6 +1492,17 @@ log_level = "{monitoring.get('log_level', 'info')}"
                 f"window_fail_rate={window_fail_rate:.2%}, window_failed={window_failed}",
             )
 
+        winner_guard = self.winner_profile_guard_decision(
+            net=net,
+            trading=trading,
+            prev_net=prev_net,
+            window_net=window_net,
+            window_fill=window_fill,
+            window_quote_delta=window_quote_delta,
+        )
+        if winner_guard is not None:
+            return winner_guard
+
         fill_toxicity = self.fill_toxicity_decision(
             window_fill,
             window_net,
@@ -893,6 +1511,31 @@ log_level = "{monitoring.get('log_level', 'info')}"
         )
         if fill_toxicity is not None:
             return fill_toxicity
+
+        no_edge_fee_guard = self.no_edge_fee_guard_decision(
+            metrics,
+            live_status=live_status,
+            profile_age=profile_age,
+            hour_index=hour_index,
+            window_fill=window_fill,
+            window_stale=window_stale,
+            window_rpc_429=window_rpc_429,
+            window_failed=window_failed,
+        )
+        if no_edge_fee_guard is not None:
+            return no_edge_fee_guard
+
+        resting_idle = self.resting_low_churn_idle_decision(
+            metrics,
+            live_status=live_status,
+            profile_age=profile_age,
+            window_fill=window_fill,
+            window_stale=window_stale,
+            window_rpc_429=window_rpc_429,
+            window_failed=window_failed,
+        )
+        if resting_idle is not None:
+            return resting_idle
 
         if quote_pct is not None:
             if self.current_profile == "fee_guard_passive_80" and profile_age >= FEE_GUARD_MIN_SECONDS:
@@ -932,6 +1575,26 @@ log_level = "{monitoring.get('log_level', 'info')}"
                     f"USDC-heavy inventory repair: quote_pct={quote_pct:.1%}, base_pct={base_pct:.1%}, base_total={base_total:.4f}",
                 )
             if self.current_profile == "overnight_balanced_low_churn":
+                if not fill_detected and not window_fill:
+                    gates_clean, gate_reason = self.discovery_gates_clean(
+                        metrics,
+                        live_status=live_status,
+                        window_stale=window_stale,
+                        window_rpc_429=window_rpc_429,
+                        window_failed=window_failed,
+                    )
+                    if gates_clean:
+                        return (
+                            "overnight_selective_edge_probe",
+                            "clean gated no-fill discovery: "
+                            f"quote_pct={quote_pct:.1%}, net_vs_hold=${net:.3f}, "
+                            "entering selective edge probe",
+                        )
+                    return (
+                        "overnight_balanced_low_churn",
+                        f"holding balanced profile; no-fill discovery gate blocked by {gate_reason}: "
+                        f"quote_pct={quote_pct:.1%}, net_vs_hold=${net:.3f}",
+                    )
                 return (
                     "overnight_balanced_low_churn",
                     f"holding overnight balanced low-churn profile: quote_pct={quote_pct:.1%}, net_vs_hold=${net:.3f}",
@@ -950,6 +1613,14 @@ log_level = "{monitoring.get('log_level', 'info')}"
                 f"holding fee guard until net edge recovers: net_vs_hold=${net:.3f}, window_fee=${window_fee:.3f}",
             )
 
+        if not has_previous:
+            return (
+                self.current_profile,
+                "startup evaluation baseline captured; waiting for a post-start "
+                f"window before applying fee/trading guards: fee=${fee_usdc:.3f}, "
+                f"trading_vs_hold=${trading:.3f}",
+            )
+
         if failed >= 5 and net < 0.02:
             return (
                 "fee_guard_passive_80",
@@ -962,13 +1633,13 @@ log_level = "{monitoring.get('log_level', 'info')}"
                 f"two-hour net loss guard: prev_net=${prev_net:.3f}, net_vs_hold=${net:.3f}",
             )
 
-        if net < 0 and window_fee > max(0.015, window_trading * 0.8):
+        if net < 0 and window_fill and window_fee > max(0.015, window_trading * 0.8):
             return (
                 "fee_guard_passive_80",
                 f"fee drag exceeds fresh trading edge: window_fee=${window_fee:.3f}, window_trading=${window_trading:.3f}, window_tx={window_tx_count}",
             )
 
-        if net < 0 and fee_usdc > max(0.05, trading * 1.5):
+        if net < 0 and window_fill and fee_usdc > max(0.05, trading * 1.5):
             return (
                 "fee_guard_passive_80",
                 f"cumulative fees dominate gross edge: fee=${fee_usdc:.3f}, trading_vs_hold=${trading:.3f}",
@@ -1019,13 +1690,43 @@ log_level = "{monitoring.get('log_level', 'info')}"
             f"holding profile; fill_detected={fill_detected}, net_vs_hold=${net:.3f}, window_fee=${window_fee:.3f}",
         )
 
-    def decide_watchdog_stop(self, metrics: Dict[str, Any], previous: Optional[Dict[str, Any]]) -> Optional[str]:
+    def decide_watchdog_action(self, metrics: Dict[str, Any], previous: Optional[Dict[str, Any]]) -> Tuple[str, Optional[str]]:
         status = metrics.get("status", {})
         market = metrics.get("market", {})
-        live_status = metrics.get("archer_live_status") or classify_archer_live_status(metrics)
+        live_status = metrics.get("archer_live_status")
+        if not isinstance(live_status, dict) or "action" not in live_status:
+            live_status = classify_archer_live_status(metrics)
         live_action = live_status.get("action")
-        if live_action in {"clear_book", "stop_supervised"}:
+        if live_action == "staleness_backoff":
+            now = time.time()
+            if now - self.last_staleness_clear_at < STALENESS_CLEAR_COOLDOWN_SECONDS:
+                return (
+                    "continue",
+                    "staleness clear cooldown active: "
+                    f"state={live_status.get('state')}, action={live_action}, "
+                    f"cooldown_secs={STALENESS_CLEAR_COOLDOWN_SECONDS}",
+                )
+            self.staleness_strikes += 1
+            if self.staleness_strikes < STALENESS_CLEAR_STRIKES:
+                backoff = STALENESS_BACKOFF_SECONDS[min(self.staleness_strikes - 1, len(STALENESS_BACKOFF_SECONDS) - 1)]
+                return (
+                    "continue",
+                    "staleness backoff before clear: "
+                    f"strike={self.staleness_strikes}/{STALENESS_CLEAR_STRIKES}, "
+                    f"retry_after_secs={backoff}, state={live_status.get('state')}",
+                )
+            self.staleness_strikes = 0
+            self.last_staleness_clear_at = now
             return (
+                "clear_book",
+                "staleness strike threshold reached; clearing book without supervised stop: "
+                f"state={live_status.get('state')}, action={live_action}, "
+                f"cooldown_secs={STALENESS_CLEAR_COOLDOWN_SECONDS}",
+            )
+        self.staleness_strikes = 0
+        if live_action == "stop_supervised":
+            return (
+                "stop",
                 "fast watchdog: live status failover action requires supervised stop: "
                 f"state={live_status.get('state')}, action={live_action}, "
                 f"restart_policy={live_status.get('restart_policy')}, "
@@ -1057,20 +1758,34 @@ log_level = "{monitoring.get('log_level', 'info')}"
         window_rpc_429 = max(0, rpc_429 - prev_rpc_429)
         window_tx_circuit = max(0, tx_circuit - prev_tx_circuit)
 
+        stale_only_burst = (
+            window_stale >= WATCHDOG_STALE_STOP
+            and window_rpc_429 < WATCHDOG_RPC429_STOP
+            and window_failed < WATCHDOG_FAILED_STOP
+            and window_tx < WATCHDOG_TX_STOP
+            and live_action in {None, "continue", "continue_degraded", "quote_reduce_only"}
+        )
+        if stale_only_burst:
+            return "continue", None
+
         if (
             window_stale >= WATCHDOG_STALE_STOP
             or window_rpc_429 >= WATCHDOG_RPC429_STOP
             or window_failed >= WATCHDOG_FAILED_STOP
-            or window_tx >= WATCHDOG_TX_STOP
         ):
             return (
+                "stop",
                 "fast watchdog stop: "
                 f"window_stale={window_stale}, window_rpc_429={window_rpc_429}, "
                 f"window_failed={window_failed}, window_tx={window_tx}, "
                 f"window_tx_circuit={window_tx_circuit}"
             )
 
-        return None
+        return "continue", None
+
+    def decide_watchdog_stop(self, metrics: Dict[str, Any], previous: Optional[Dict[str, Any]]) -> Optional[str]:
+        action, reason = self.decide_watchdog_action(metrics, previous)
+        return reason if action == "stop" else None
 
     def switch_profile(self, next_profile: str, reason: str, metrics: Optional[Dict[str, Any]], event: str) -> None:
         if next_profile == "__stop__":
@@ -1081,11 +1796,17 @@ log_level = "{monitoring.get('log_level', 'info')}"
             self.clear_book()
             self.stop_requested = True
             return
+        next_profile, reason = resolve_profile_approval(
+            next_profile,
+            reason,
+            source=f"adaptive:{event}",
+        )
         changed = next_profile != self.current_profile
         if changed:
             self.log(f"Switching profile {self.current_profile} -> {next_profile}: {reason}")
             self.current_profile = next_profile
             self.profile_entered_at = time.time()
+            self.winner_high_water_net = None
             self.write_active_config(next_profile, reason)
             self.stop_screen(ACTIVE_SCREEN)
             self.stop_bot_processes()
@@ -1147,10 +1868,21 @@ log_level = "{monitoring.get('log_level', 'info')}"
                     break
                 try:
                     watchdog_metrics = self.collect_metrics()
-                    stop_reason = self.decide_watchdog_stop(watchdog_metrics, watchdog_previous)
+                    watchdog_action, watchdog_reason = self.decide_watchdog_action(watchdog_metrics, watchdog_previous)
                     watchdog_previous = watchdog_metrics
-                    if stop_reason:
-                        self.switch_profile("__stop__", stop_reason, metrics=watchdog_metrics, event=f"watchdog_hour_{hour_index}")
+                    if watchdog_action == "stop" and watchdog_reason:
+                        self.switch_profile("__stop__", watchdog_reason, metrics=watchdog_metrics, event=f"watchdog_hour_{hour_index}")
+                        break
+                    if watchdog_action == "clear_book" and watchdog_reason:
+                        self.log(watchdog_reason)
+                        self.append_ledger(
+                            f"watchdog_hour_{hour_index}",
+                            self.current_profile,
+                            watchdog_reason,
+                            metrics=watchdog_metrics,
+                            changed=False,
+                        )
+                        self.clear_book()
                         break
                 except Exception as exc:  # noqa: BLE001
                     self.log(f"Fast watchdog metrics failed; stopping to avoid blind live trading: {exc}")
@@ -1198,12 +1930,26 @@ def main() -> None:
         default=os.environ.get("ARCHER_ADAPTIVE_INITIAL_REASON", "initial adaptive flow probe"),
     )
     args = parser.parse_args()
+    try:
+        validate_start_args(
+            args.run_id,
+            args.duration_seconds,
+            args.evaluation_seconds,
+            args.initial_profile,
+        )
+    except ValueError as exc:
+        parser.error(str(exc))
+    initial_profile, initial_reason = resolve_profile_approval(
+        args.initial_profile,
+        args.initial_reason,
+        source="adaptive:start",
+    )
     AdaptiveController(
         args.run_id,
         args.duration_seconds,
         args.evaluation_seconds,
-        args.initial_profile,
-        args.initial_reason,
+        initial_profile,
+        initial_reason,
     ).run()
 
 

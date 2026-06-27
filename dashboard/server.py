@@ -47,7 +47,7 @@ ARCHER_IX_NAMES = {
 }
 RUN_PREFIXES = ("adaptive-12h-", "usdc-style-12h-")
 DASHBOARD_COMMAND_TIMEOUT = float(os.environ.get("ARCHER_DASHBOARD_COMMAND_TIMEOUT", "2"))
-DASHBOARD_RPC_TIMEOUT = float(os.environ.get("ARCHER_DASHBOARD_RPC_TIMEOUT", "1.5"))
+DASHBOARD_RPC_TIMEOUT = float(os.environ.get("ARCHER_DASHBOARD_RPC_TIMEOUT", "5"))
 CONTROLLER_HEARTBEAT_MAX_AGE_SECONDS = float(
     os.environ.get("ARCHER_CONTROLLER_HEARTBEAT_MAX_AGE_SECONDS", "90")
 )
@@ -110,8 +110,22 @@ def classify_archer_live_status(metrics: Dict[str, Any]) -> Dict[str, Any]:
     heartbeat_healthy = bool(
         existing.get("heartbeat_healthy", heartbeat.get("healthy", True))
     )
+    process = metrics.get("process")
+    process = process if isinstance(process, dict) else {}
+    heartbeat_event = str(heartbeat.get("event") or "").lower()
+    completed_controller = (
+        heartbeat_event == "complete"
+        and not bool(process.get("bot_running", False))
+        and not bool(process.get("controller_running", False))
+    )
 
-    if not heartbeat_healthy:
+    if not heartbeat_healthy and completed_controller:
+        state = "completed"
+        action = "idle"
+        restart_policy = "manual_only"
+        severity = "info"
+        reason = "controller completed and bot is not running"
+    elif not heartbeat_healthy:
         state = "heartbeat_missing"
         action = "stop_supervised"
         restart_policy = "manual_only"
@@ -119,10 +133,10 @@ def classify_archer_live_status(metrics: Dict[str, Any]) -> Dict[str, Any]:
         reason = "controller heartbeat is missing or stale; supervised stop required before trusting metrics"
     elif rpc_stale and dashboard_stale:
         state = "both_stale"
-        action = "clear_book"
+        action = "staleness_backoff"
         restart_policy = "manual_only"
-        severity = "critical"
-        reason = "dashboard snapshot and direct Archer RPC readback are stale; clear live book before continuing"
+        severity = "warning"
+        reason = "dashboard snapshot and direct Archer RPC readback are stale; controller staleness backoff decides whether to clear"
     elif rpc_stale and dashboard_healthy and not dashboard_stale:
         state = "rpc_stale_dashboard_healthy"
         action = "quote_reduce_only"
@@ -163,9 +177,85 @@ def classify_archer_live_status(metrics: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def parent_child_attribution(metrics: Dict[str, Any]) -> Dict[str, str]:
+    status = metrics.get("status")
+    status = status if isinstance(status, dict) else {}
+    strategy = metrics.get("strategy")
+    strategy = strategy if isinstance(strategy, dict) else {}
+    market_intel = metrics.get("market_intel")
+    market_intel = market_intel if isinstance(market_intel, dict) else {}
+    live_status = metrics.get("archer_live_status")
+    live_status = live_status if isinstance(live_status, dict) else {}
+
+    parent_mode = str(market_intel.get("parent_cluster_mode") or "").lower()
+    child_mode = str(market_intel.get("mode") or "").lower()
+    profile = str(strategy.get("active_profile") or "").lower()
+    bid_levels = int(status.get("bid_levels") or 0)
+    ask_levels = int(status.get("ask_levels") or 0)
+    live_action = str(live_status.get("action") or "").lower()
+
+    if parent_mode and parent_mode not in {"normal", "unknown"}:
+        return {
+            "parent_child_attribution": "parent_cluster_guard",
+            "parent_child_deviation_reason": f"parent cluster mode is {parent_mode}",
+        }
+    if child_mode and child_mode not in {"normal", "unknown"}:
+        return {
+            "parent_child_attribution": "child_market_intel_guard",
+            "parent_child_deviation_reason": f"child market-intel mode is {child_mode}",
+        }
+    if profile == "fee_guard_passive_80":
+        return {
+            "parent_child_attribution": "parent_normal_local_fee_guard",
+            "parent_child_deviation_reason": "parent normal; Archer local fee/no-fill guard is driving passive profile",
+        }
+    if live_action and live_action not in {"continue", "continue_degraded"}:
+        return {
+            "parent_child_attribution": f"parent_normal_local_{live_action}",
+            "parent_child_deviation_reason": f"parent normal; Archer local live action is {live_action}",
+        }
+    if bid_levels <= 0 or ask_levels <= 0:
+        return {
+            "parent_child_attribution": "parent_normal_local_not_quoting",
+            "parent_child_deviation_reason": "parent normal; Archer local book is not two-sided",
+        }
+    return {
+        "parent_child_attribution": "parent_child_aligned",
+        "parent_child_deviation_reason": "parent and Archer local controls are aligned",
+    }
+
+
+def profile_approval_summary(profile: Optional[str], reason: Optional[str], settings: Dict[str, Any]) -> Dict[str, Any]:
+    approval = settings.get("profile_approval")
+    if isinstance(approval, dict):
+        return {
+            **approval,
+            "requested_profile": approval.get("requested_profile") or approval.get("profile") or profile,
+            "effective_profile": profile,
+        }
+
+    reason_text = str(reason or "")
+    requested_match = re.search(r"requested_profile=([A-Za-z0-9_\\-]+)", reason_text)
+    effective_match = re.search(r"effective_profile=([A-Za-z0-9_\\-]+)", reason_text)
+    denied = "profile_approval_denied" in reason_text
+    explicit = "approved" in reason_text.lower()
+    source = "legacy_reason_explicit_approval" if explicit else "missing_profile_approval_metadata"
+    return {
+        "approved": explicit and not denied,
+        "profile": profile,
+        "requested_profile": requested_match.group(1) if requested_match else profile,
+        "effective_profile": effective_match.group(1) if effective_match else profile,
+        "source": source,
+        "default_allowed": None,
+        "explicitly_allowed": explicit and not denied,
+        "metadata_missing": True,
+    }
+
+
 def parse_market_intel_payload(payload: Dict[str, Any], url: str) -> Dict[str, Any]:
     signal = payload.get("signal") if isinstance(payload.get("signal"), dict) else payload
     recommendation = signal.get("recommendation") or {}
+    checks = signal.get("checks") if isinstance(signal.get("checks"), dict) else {}
     return {
         "enabled": True,
         "ok": True,
@@ -173,6 +263,11 @@ def parse_market_intel_payload(payload: Dict[str, Any], url: str) -> Dict[str, A
         "consumer": payload.get("consumer"),
         "allowed_source_set": payload.get("allowed_source_set") or [],
         "excluded_source_set": payload.get("excluded_source_set") or [],
+        "generated_at_unix_secs": payload.get("generated_at_unix_secs")
+        or signal.get("generated_at_unix_secs"),
+        "source_quality": payload.get("source_quality")
+        or signal.get("source_quality")
+        or {},
         "mode": signal.get("mode"),
         "quote_enabled": recommendation.get("quote_enabled"),
         "fair_value": recommendation.get("fair_value"),
@@ -182,6 +277,17 @@ def parse_market_intel_payload(payload: Dict[str, Any], url: str) -> Dict[str, A
         "ask_size_multiplier": recommendation.get("ask_size_multiplier"),
         "summary": signal.get("summary"),
         "reasons": recommendation.get("reasons") or [],
+        "parent_cluster_id": checks.get("parent_cluster_id"),
+        "parent_cluster_mode": checks.get("parent_cluster_mode"),
+        "parent_cluster_child_markets": checks.get("parent_cluster_child_markets") or [],
+        "parent_cluster_child_venues": checks.get("parent_cluster_child_venues") or [],
+        "parent_cluster_aggregate_base_inventory": checks.get(
+            "parent_cluster_aggregate_base_inventory"
+        ),
+        "parent_cluster_portfolio_net_base": checks.get("parent_cluster_portfolio_net_base"),
+        "parent_cluster_base_pyth_conf_bps": checks.get("parent_cluster_base_pyth_conf_bps"),
+        "parent_cluster_hedge_status": checks.get("parent_cluster_hedge_status"),
+        "parent_cluster_reason_codes": checks.get("parent_cluster_reason_codes") or [],
     }
 
 
@@ -353,7 +459,10 @@ def effective_spreads_bps(spreads: Any, floor: Any) -> List[float]:
 def discover_run_dir(explicit: Optional[str]) -> Optional[pathlib.Path]:
     if explicit:
         path = pathlib.Path(explicit).expanduser()
-        return path if path.is_absolute() else ROOT / path
+        resolved = path if path.is_absolute() else ROOT / path
+        if resolved.name in {"adaptive-12h-latest", "adaptive-12h-"} and not resolved.exists():
+            return discover_run_dir(None)
+        return resolved
     candidates = []
     for prefix in RUN_PREFIXES:
         candidates.extend(
@@ -912,10 +1021,7 @@ class DashboardState:
     def get_baseline(self) -> Dict[str, Any]:
         status = None
         if self.run_dir:
-            status = parse_first_commands_status(self.run_dir / "commands.log")
-            if not status:
-                status = parse_snapshot_status(self.run_dir / "00_before.snapshot.txt")
-            if not status and self.sample_path:
+            if self.sample_path:
                 baseline = parse_first_history_baseline(self.sample_path)
                 if baseline:
                     return {
@@ -925,6 +1031,9 @@ class DashboardState:
                         "snapshot": baseline["source"],
                         "sample_time": baseline.get("time"),
                     }
+            status = parse_first_commands_status(self.run_dir / "commands.log")
+            if not status:
+                status = parse_snapshot_status(self.run_dir / "00_before.snapshot.txt")
         if not status:
             status = {
                 "mid_ticks": None,
@@ -1037,6 +1146,45 @@ class DashboardState:
             "net_portfolio_pnl_usdc": current_value - start_value - fee_usdc,
         }
 
+    def add_fill_window_metrics(self, pnl: Dict[str, Any]) -> Dict[str, Any]:
+        enriched = dict(pnl)
+        history = self.read_history(limit=200) if self.sample_path else []
+        previous = next(
+            (sample for sample in reversed(history) if "base_delta" in sample or "quote_delta" in sample),
+            None,
+        )
+        if previous:
+            prev_base = float(previous.get("base_delta") or 0.0)
+            prev_quote = float(previous.get("quote_delta") or 0.0)
+            fills_this_window = int(
+                abs(float(pnl.get("base_delta") or 0.0) - prev_base) > 0.000001
+                or abs(float(pnl.get("quote_delta") or 0.0) - prev_quote) > 0.0001
+            )
+            total_fills = int(previous.get("total_fills") or 0) + fills_this_window
+        else:
+            fills_this_window = int(bool(pnl.get("fill_detected")))
+            total_fills = fills_this_window
+
+        if fills_this_window:
+            seconds_since_last_fill = 0.0
+        else:
+            last_fill_time = None
+            for sample in reversed(history):
+                if int(sample.get("fills_this_window") or 0) > 0:
+                    last_fill_time = parse_iso_time(sample.get("time"))
+                    break
+            if last_fill_time is not None:
+                seconds_since_last_fill = max(0.0, (now_utc() - last_fill_time).total_seconds())
+            elif self.run_start is not None:
+                seconds_since_last_fill = max(0.0, (now_utc() - self.run_start).total_seconds())
+            else:
+                seconds_since_last_fill = None
+
+        enriched["fills_this_window"] = fills_this_window
+        enriched["total_fills"] = total_fills
+        enriched["seconds_since_last_fill"] = seconds_since_last_fill
+        return enriched
+
     def collect_metrics(self) -> Dict[str, Any]:
         self.config = load_simple_toml(self.config_path)
         self.rpc_url = str(self.config.get("connection", {}).get("rpc_url", self.rpc_url))
@@ -1086,6 +1234,30 @@ class DashboardState:
             if strategy_ledger.get("active")
             else None
         ) or {}
+        pnl = self.add_fill_window_metrics(self.compute_pnl(status, baseline, transactions, mid_price))
+        active_started_at = (
+            parse_iso_time(strategy_ledger.get("active", {}).get("time"))
+            if strategy_ledger.get("active")
+            else None
+        )
+        trial_minutes = active_settings.get("forced_transition_trial_minutes")
+        forced_remaining = None
+        if active_started_at is not None and trial_minutes is not None:
+            forced_remaining = max(
+                0.0,
+                float(trial_minutes) - (now_utc() - active_started_at).total_seconds() / 60.0,
+            )
+        active_profile = (
+            strategy_ledger.get("active", {}).get("profile")
+            if strategy_ledger.get("active")
+            else None
+        )
+        active_reason = (
+            strategy_ledger.get("active", {}).get("reason")
+            if strategy_ledger.get("active")
+            else None
+        )
+        approval_summary = profile_approval_summary(active_profile, active_reason, active_settings)
         metrics = {
             "time": iso(),
             "config_path": str(self.config_path),
@@ -1104,7 +1276,7 @@ class DashboardState:
             "dashboard_health": dashboard_health,
             "mid_price": mid_price,
             "baseline": baseline,
-            "pnl": self.compute_pnl(status, baseline, transactions, mid_price),
+            "pnl": pnl,
             "wallet": {
                 "pubkey": self.wallet_pubkey,
                 "balances": balances,
@@ -1115,12 +1287,11 @@ class DashboardState:
             "controller_heartbeat": controller_heartbeat,
             "logs": logs,
             "strategy": {
-                "active_profile": strategy_ledger.get("active", {}).get("profile")
-                if strategy_ledger.get("active")
-                else None,
-                "active_reason": strategy_ledger.get("active", {}).get("reason")
-                if strategy_ledger.get("active")
-                else None,
+                "active_profile": active_profile,
+                "requested_profile": approval_summary.get("requested_profile"),
+                "effective_profile": approval_summary.get("effective_profile"),
+                "profile_approval": approval_summary,
+                "active_reason": active_reason,
                 "active_description": strategy_ledger.get("active", {}).get("description")
                 if strategy_ledger.get("active")
                 else None,
@@ -1159,10 +1330,12 @@ class DashboardState:
                 "priority_fee_cap": self.config.get("execution", {}).get(
                     "priority_fee_max_microlamports"
                 ),
+                "forced_transition_remaining_trial_minutes": forced_remaining,
             },
             "strategy_ledger": strategy_ledger,
         }
         metrics["archer_live_status"] = classify_archer_live_status(metrics)
+        metrics.update(parent_child_attribution(metrics))
         return metrics
 
     def sample_from_metrics(self, metrics: Dict[str, Any]) -> Dict[str, Any]:
@@ -1171,6 +1344,9 @@ class DashboardState:
         tx = metrics.get("transactions", {})
         market_intel = metrics.get("market_intel", {})
         live_status = metrics.get("archer_live_status", {})
+        strategy = metrics.get("strategy", {})
+        approval = strategy.get("profile_approval") if isinstance(strategy, dict) else {}
+        approval = approval if isinstance(approval, dict) else {}
         return {
             "time": metrics.get("time"),
             "mid_price": metrics.get("mid_price"),
@@ -1180,6 +1356,12 @@ class DashboardState:
             "base_total": status.get("base_total"),
             "quote_total": status.get("quote_total"),
             "gross_pnl_usdc": pnl.get("gross_pnl_usdc"),
+            "base_delta": pnl.get("base_delta"),
+            "quote_delta": pnl.get("quote_delta"),
+            "fill_detected": pnl.get("fill_detected"),
+            "seconds_since_last_fill": pnl.get("seconds_since_last_fill"),
+            "fills_this_window": pnl.get("fills_this_window"),
+            "total_fills": pnl.get("total_fills"),
             "trading_vs_hold_usdc": pnl.get("trading_vs_hold_usdc"),
             "net_trading_vs_hold_usdc": pnl.get("net_trading_vs_hold_usdc"),
             "fee_sol": pnl.get("fee_sol"),
@@ -1190,6 +1372,10 @@ class DashboardState:
             "live_state": live_status.get("state"),
             "live_action": live_status.get("action"),
             "live_restart_policy": live_status.get("restart_policy"),
+            "requested_profile": strategy.get("requested_profile") if isinstance(strategy, dict) else None,
+            "effective_profile": strategy.get("effective_profile") if isinstance(strategy, dict) else None,
+            "profile_approval_approved": approval.get("approved"),
+            "profile_approval_source": approval.get("source"),
             "intel_mode": market_intel.get("mode"),
             "intel_fair_value": market_intel.get("fair_value"),
             "intel_spread_add_bps": market_intel.get("spread_add_bps"),
@@ -1197,8 +1383,18 @@ class DashboardState:
             "intel_bid_size_multiplier": market_intel.get("bid_size_multiplier"),
             "intel_ask_size_multiplier": market_intel.get("ask_size_multiplier"),
             "intel_reasons": market_intel.get("reasons"),
+            "parent_cluster_id": market_intel.get("parent_cluster_id"),
+            "parent_cluster_mode": market_intel.get("parent_cluster_mode"),
+            "parent_cluster_child_markets": market_intel.get("parent_cluster_child_markets"),
+            "parent_cluster_child_venues": market_intel.get("parent_cluster_child_venues"),
+            "parent_cluster_base_pyth_conf_bps": market_intel.get("parent_cluster_base_pyth_conf_bps"),
+            "parent_cluster_hedge_status": market_intel.get("parent_cluster_hedge_status"),
+            "parent_cluster_reason_codes": market_intel.get("parent_cluster_reason_codes"),
             "min_effective_spread_bps": metrics.get("strategy", {}).get("min_effective_spread_bps"),
             "effective_spreads_bps": metrics.get("strategy", {}).get("effective_spreads_bps"),
+            "forced_transition_remaining_trial_minutes": metrics.get("strategy", {}).get(
+                "forced_transition_remaining_trial_minutes"
+            ),
         }
 
     def record_sample(self, metrics: Dict[str, Any]) -> None:

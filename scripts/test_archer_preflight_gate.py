@@ -32,6 +32,9 @@ def args(**overrides: object) -> argparse.Namespace:
         "require_clear_book": True,
         "require_owner_match": True,
         "require_market_intel": True,
+        "require_market_intel_dns": False,
+        "market_intel_host": "market-intel",
+        "max_market_intel_age_secs": 45.0,
     }
     defaults.update(overrides)
     return argparse.Namespace(**defaults)
@@ -64,6 +67,7 @@ def healthy_metrics() -> dict:
             "quote_enabled": True,
             "url": "http://market-intel:8790/api/signals/scoped/archer/sol_usdc",
             "fair_value": "80.1",
+            "source_quality": {"status": "ok", "stale": False},
             "spread_add_bps": "12.0",
         },
         "logs": {
@@ -111,6 +115,41 @@ class ArcherPreflightGateTests(unittest.TestCase):
 
         self.assertIs(metrics, ready)
         self.assertEqual(failures, [])
+
+    def test_accepts_per_source_market_intel_quality_list(self) -> None:
+        metrics = healthy_metrics()
+        metrics["market_intel"]["source_quality"] = [
+            {
+                "source": "binance",
+                "freshness_status": "fresh",
+                "quality_status": "healthy",
+                "policy_impact": ["quote_blocking"],
+            },
+            {
+                "source": "solana_rpc",
+                "freshness_status": "fresh",
+                "quality_status": "healthy",
+                "policy_impact": ["quote_blocking", "hedge_blocking"],
+            },
+        ]
+
+        self.assertEqual(validate_metrics(metrics, args()), [])
+
+    def test_accepts_effective_spreads_when_min_effective_field_is_missing(self) -> None:
+        metrics = healthy_metrics()
+        metrics["strategy"]["min_effective_spread_bps"] = 0.0
+        metrics["strategy"]["effective_spreads_bps"] = [16.0, 24.0, 36.0]
+
+        self.assertEqual(
+            validate_metrics(metrics, args(min_effective_spread_bps=16.0)),
+            [],
+        )
+
+    def test_rejects_unresolvable_market_intel_container_dns(self) -> None:
+        with mock.patch.object(archer_preflight_gate.socket, "getaddrinfo", side_effect=OSError("no host")):
+            failures = validate_metrics(healthy_metrics(), args(require_market_intel_dns=True))
+
+        self.assertTrue(any("market-intel DNS failed" in failure for failure in failures))
 
 
 if __name__ == "__main__":

@@ -123,11 +123,6 @@ def validate_metrics(metrics: dict[str, Any], args: argparse.Namespace) -> list[
         failures.append(
             f"active profile {strategy.get('active_profile')} != expected {args.expected_profile}"
         )
-    min_effective = as_float(strategy.get("min_effective_spread_bps"))
-    if not math.isfinite(min_effective) or min_effective < args.min_effective_spread_bps:
-        failures.append(
-            f"min effective spread {min_effective:.2f}bps < {args.min_effective_spread_bps:.2f}bps"
-        )
     effective_spreads = strategy.get("effective_spreads_bps") or []
     if effective_spreads:
         tightest = min(as_float(value) for value in effective_spreads)
@@ -135,20 +130,44 @@ def validate_metrics(metrics: dict[str, Any], args: argparse.Namespace) -> list[
             failures.append(
                 f"tightest effective spread {tightest:.2f}bps < {args.min_effective_spread_bps:.2f}bps"
             )
+    else:
+        min_effective = as_float(strategy.get("min_effective_spread_bps"))
+        if not math.isfinite(min_effective) or min_effective < args.min_effective_spread_bps:
+            failures.append(
+                f"min effective spread {min_effective:.2f}bps < {args.min_effective_spread_bps:.2f}bps"
+            )
 
     market_intel = metrics.get("market_intel", {})
     if args.require_market_intel:
+        if getattr(args, "require_market_intel_dns", False):
+            host = str(getattr(args, "market_intel_host", "market-intel") or "market-intel")
+            try:
+                socket.getaddrinfo(host, 8790)
+            except OSError as exc:
+                failures.append(f"market-intel DNS failed for {host}: {exc}")
         if not market_intel.get("enabled"):
             failures.append("market-intel is disabled")
         if not market_intel.get("ok"):
             failures.append("market-intel is not ok")
         if not market_intel.get("quote_enabled"):
             failures.append("market-intel has disabled quoting")
+        if str(market_intel.get("mode") or "").lower() == "pause":
+            failures.append("market-intel mode is pause")
         if "market-intel" not in str(market_intel.get("url", "")):
             failures.append(f"market-intel URL is not shared service: {market_intel.get('url')}")
         fair_value = as_float(market_intel.get("fair_value"))
         if not math.isfinite(fair_value) or fair_value <= 0.0:
             failures.append(f"market-intel fair value is invalid: {market_intel.get('fair_value')}")
+        source_failure = market_intel_source_quality_failure(market_intel.get("source_quality"))
+        if source_failure:
+            failures.append(source_failure)
+        generated_at = as_float(market_intel.get("generated_at_unix_secs"))
+        if math.isfinite(generated_at):
+            age_secs = time.time() - generated_at
+            if age_secs > args.max_market_intel_age_secs:
+                failures.append(
+                    f"market-intel source age {age_secs:.0f}s > {args.max_market_intel_age_secs:.0f}s"
+                )
         spread_add = as_float(market_intel.get("spread_add_bps"), 0.0)
         if spread_add < args.min_market_intel_spread_add_bps:
             failures.append(
@@ -169,6 +188,28 @@ def validate_metrics(metrics: dict[str, Any], args: argparse.Namespace) -> list[
             failures.append(f"{key} count {value:.0f} > {limit:.0f}")
 
     return failures
+
+
+def market_intel_source_quality_failure(source_quality: Any) -> str | None:
+    if isinstance(source_quality, dict):
+        source_status = str(source_quality.get("status") or "").lower()
+        if source_status not in {"ok", "fresh", "clean", "healthy"} or source_quality.get("stale") is True:
+            return f"market-intel source freshness is {source_status or 'unknown'}"
+        return None
+
+    if isinstance(source_quality, list) and source_quality:
+        for source in source_quality:
+            freshness = str(source.get("freshness_status") or source.get("status") or "").lower()
+            quality = str(source.get("quality_status") or source.get("quality") or "").lower()
+            if freshness not in {"fresh", "ok", "clean", "healthy"}:
+                name = source.get("source") or "unknown"
+                return f"market-intel source {name} freshness is {freshness or 'unknown'}"
+            if quality not in {"healthy", "ok", "fresh", "clean"}:
+                name = source.get("source") or "unknown"
+                return f"market-intel source {name} quality is {quality or 'unknown'}"
+        return None
+
+    return "market-intel source freshness is missing"
 
 
 def main() -> None:
@@ -197,12 +238,16 @@ def main() -> None:
     parser.add_argument("--allow-live-book", action="store_true")
     parser.add_argument("--allow-market-owner-mismatch", action="store_true")
     parser.add_argument("--allow-missing-market-intel", action="store_true")
+    parser.add_argument("--allow-market-intel-dns-unresolved", action="store_true")
+    parser.add_argument("--market-intel-host", default="market-intel")
+    parser.add_argument("--max-market-intel-age-secs", type=float, default=45.0)
     args = parser.parse_args()
     args.require_no_bot = not args.allow_running_bot
     args.require_no_controller = not args.allow_running_controller
     args.require_clear_book = not args.allow_live_book
     args.require_owner_match = not args.allow_market_owner_mismatch
     args.require_market_intel = not args.allow_missing_market_intel
+    args.require_market_intel_dns = not args.allow_market_intel_dns_unresolved
 
     metrics, failures = wait_for_valid_metrics(args)
     if failures:

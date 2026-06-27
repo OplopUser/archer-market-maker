@@ -7,6 +7,28 @@ PROFILE="${ARCHER_INITIAL_PROFILE:-overnight_balanced_low_churn}"
 REASON="${ARCHER_INITIAL_REASON:-direct normal-spread run; adaptive disabled}"
 LOG_DIR="/app/logs/adaptive-12h-${RUN_ID}"
 
+APPROVAL_RESULT="$(
+  ARCHER_REQUESTED_PROFILE="$PROFILE" ARCHER_REQUESTED_REASON="$REASON" python3 - <<'PY'
+import os
+import sys
+
+sys.path.insert(0, "/app")
+from scripts.archer_adaptive_12h import resolve_profile_approval
+
+profile, reason = resolve_profile_approval(
+    os.environ["ARCHER_REQUESTED_PROFILE"],
+    os.environ["ARCHER_REQUESTED_REASON"],
+    source="direct_runner:start",
+)
+print(profile)
+print(reason)
+PY
+)"
+PROFILE="$(printf '%s\n' "$APPROVAL_RESULT" | sed -n '1p')"
+REASON="$(printf '%s\n' "$APPROVAL_RESULT" | sed -n '2,$p')"
+export ARCHER_INITIAL_PROFILE="$PROFILE"
+export ARCHER_INITIAL_REASON="$REASON"
+
 DEFAULT_PREFLIGHT_MIN_SPREAD="$(
   ARCHER_INITIAL_PROFILE="$PROFILE" python3 - <<'PY'
 import os
@@ -40,6 +62,16 @@ c.log(f"Starting direct Archer run_id={run_id} profile={profile} duration_second
 c.write_active_config(profile, reason)
 c.log("Wrote active config; direct runner will clear on exit only if live levels remain")
 PY
+
+USE_ADAPTIVE_CONTROLLER="$(printf '%s' "${ARCHER_DIRECT_USE_ADAPTIVE_CONTROLLER:-true}" | tr '[:upper:]' '[:lower:]')"
+if [[ "$USE_ADAPTIVE_CONTROLLER" == "1" || "$USE_ADAPTIVE_CONTROLLER" == "true" || "$USE_ADAPTIVE_CONTROLLER" == "yes" || "$USE_ADAPTIVE_CONTROLLER" == "on" ]]; then
+  exec python3 scripts/archer_adaptive_12h.py \
+    --run-id "$RUN_ID" \
+    --duration-seconds "$DURATION_SECONDS" \
+    --evaluation-seconds "${ARCHER_EVALUATION_SECONDS:-1800}" \
+    --initial-profile "$PROFILE" \
+    --initial-reason "$REASON"
+fi
 
 PREFLIGHT_URL="${ARCHER_PREFLIGHT_METRICS_URL:-http://archer-dashboard:8787/api/metrics}"
 python3 scripts/archer_preflight_gate.py \

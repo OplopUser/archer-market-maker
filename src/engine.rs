@@ -44,6 +44,8 @@ enum MissingLevelAction {
     AcceptReducedDepth,
     Refresh,
     Throttle,
+    RecoveryRefresh,
+    RecoveryThrottle,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
@@ -116,6 +118,7 @@ fn missing_level_action(
     expected_ask_count: u64,
     update_landed: bool,
     refresh_too_soon: bool,
+    recovery_too_soon: bool,
 ) -> MissingLevelAction {
     if !update_landed || expected_bid_count + expected_ask_count == 0 {
         return MissingLevelAction::Ignore;
@@ -126,6 +129,15 @@ fn missing_level_action(
 
     let active_level_count = active_bid_count + active_ask_count;
     if active_level_count > 0 {
+        let bid_side_empty = expected_bid_count > 0 && active_bid_count == 0;
+        let ask_side_empty = expected_ask_count > 0 && active_ask_count == 0;
+        if bid_side_empty || ask_side_empty {
+            return if recovery_too_soon {
+                MissingLevelAction::RecoveryThrottle
+            } else {
+                MissingLevelAction::RecoveryRefresh
+            };
+        }
         return MissingLevelAction::AcceptReducedDepth;
     }
     if refresh_too_soon {
@@ -139,10 +151,12 @@ fn should_continue_after_missing_level_action(
     post_fill_cooldown_active: bool,
 ) -> bool {
     match action {
-        MissingLevelAction::Ignore | MissingLevelAction::Refresh => false,
-        MissingLevelAction::AcceptReducedDepth | MissingLevelAction::Throttle => {
-            !post_fill_cooldown_active
-        }
+        MissingLevelAction::Ignore
+        | MissingLevelAction::Refresh
+        | MissingLevelAction::RecoveryRefresh => false,
+        MissingLevelAction::AcceptReducedDepth
+        | MissingLevelAction::Throttle
+        | MissingLevelAction::RecoveryThrottle => !post_fill_cooldown_active,
     }
 }
 
@@ -160,7 +174,17 @@ fn should_throttle_full_update(
     }
 
     let reduces_exposure = new_bid_count < expected_bid_count || new_ask_count < expected_ask_count;
-    !reduces_exposure
+    let flips_empty_side = (expected_bid_count == 0
+        && expected_ask_count > 0
+        && new_bid_count > 0
+        && new_ask_count == 0)
+        || (expected_ask_count == 0
+            && expected_bid_count > 0
+            && new_ask_count > 0
+            && new_bid_count == 0);
+    let restores_empty_side = (expected_bid_count == 0 && new_bid_count > 0 && new_ask_count > 0)
+        || (expected_ask_count == 0 && new_ask_count > 0 && new_bid_count > 0);
+    !(restores_empty_side || (reduces_exposure && !flips_empty_side))
 }
 
 fn skip_mid_update(
@@ -222,6 +246,8 @@ pub async fn run_engine(
         Duration::from_millis(mm_config.execution.min_mid_update_interval_ms);
     let min_full_refresh_interval =
         Duration::from_millis(mm_config.execution.min_full_refresh_interval_ms);
+    let min_empty_side_recovery_interval =
+        Duration::from_millis(mm_config.execution.min_empty_side_recovery_interval_ms);
     let min_mid_update_ticks = mm_config.execution.min_mid_update_ticks;
     let post_fill_cooldown = Duration::from_millis(mm_config.strategy.post_fill_cooldown_ms);
     let post_fill_side_size_multiplier = mm_config
@@ -244,6 +270,7 @@ pub async fn run_engine(
     let mut last_full_update_at: Option<Instant> = None;
     let mut last_missing_level_refresh_at: Option<Instant> = None;
     let mut force_next_full_update: bool = false;
+    let mut force_recovery_update: bool = false;
     let mut needs_initial_book: bool = true;
     let mut local_seq: u64 = initial_sequence_number;
     let mut stale_feed_guard = StaleFeedGuard::default();
@@ -281,7 +308,7 @@ pub async fn run_engine(
                     tx_sender.fire(
                         vec![ix],
                         TxPriority::Emergency,
-                        TxPurpose::ClearBook,
+                        TxPurpose::SafetyClearBook,
                         CU_CLEAR_BOOK,
                     );
                 } else {
@@ -379,7 +406,7 @@ pub async fn run_engine(
                 tx_sender.fire(
                     vec![ix],
                     TxPriority::Emergency,
-                    TxPurpose::ClearBook,
+                    TxPurpose::SafetyClearBook,
                     CU_CLEAR_BOOK,
                 );
                 state.clear_book_sends.fetch_add(1, Relaxed);
@@ -432,7 +459,7 @@ pub async fn run_engine(
                 tx_sender.fire(
                     vec![ix],
                     TxPriority::Emergency,
-                    TxPurpose::ClearBook,
+                    TxPurpose::SafetyClearBook,
                     CU_CLEAR_BOOK,
                 );
                 state.clear_book_sends.fetch_add(1, Relaxed);
@@ -540,6 +567,9 @@ pub async fn run_engine(
             let refresh_too_soon = last_missing_level_refresh_at
                 .map(|last| last.elapsed() < min_full_refresh_interval)
                 .unwrap_or(false);
+            let recovery_too_soon = last_missing_level_refresh_at
+                .map(|last| last.elapsed() < min_empty_side_recovery_interval)
+                .unwrap_or(false);
             match missing_level_action(
                 active_bid_count,
                 active_ask_count,
@@ -547,6 +577,7 @@ pub async fn run_engine(
                 last_expected_ask_count,
                 update_landed,
                 refresh_too_soon,
+                recovery_too_soon,
             ) {
                 MissingLevelAction::Ignore => {}
                 MissingLevelAction::AcceptReducedDepth => {
@@ -596,6 +627,41 @@ pub async fn run_engine(
                         "Post-fill cooldown active; bypassing missing-level throttle for risk reduction"
                     );
                     force_next_full_update = true;
+                    last_structure_hash = 0;
+                }
+                MissingLevelAction::RecoveryRefresh => {
+                    tracing::info!(
+                        active_bid_count,
+                        active_ask_count,
+                        last_expected_bid_count,
+                        last_expected_ask_count,
+                        "Detected empty Archer quote side, forcing recovery refresh"
+                    );
+                    last_missing_level_refresh_at = Some(Instant::now());
+                    force_next_full_update = true;
+                    force_recovery_update = true;
+                    needs_initial_book = true;
+                    last_structure_hash = 0;
+                }
+                MissingLevelAction::RecoveryThrottle => {
+                    tracing::debug!(
+                        active_bid_count,
+                        active_ask_count,
+                        last_expected_bid_count,
+                        last_expected_ask_count,
+                        min_empty_side_recovery_interval_ms =
+                            min_empty_side_recovery_interval.as_millis(),
+                        "Detected empty Archer quote side but recovery refresh is throttled"
+                    );
+                    if should_continue_after_missing_level_action(
+                        MissingLevelAction::RecoveryThrottle,
+                        post_fill_cooldown_active,
+                    ) {
+                        state.cycles_total.fetch_add(1, Relaxed);
+                        continue;
+                    }
+                    force_next_full_update = true;
+                    force_recovery_update = true;
                     last_structure_hash = 0;
                 }
                 MissingLevelAction::Refresh => {
@@ -677,7 +743,7 @@ pub async fn run_engine(
                     tx_sender.fire(
                         vec![ix],
                         TxPriority::Normal,
-                        TxPurpose::ClearBook,
+                        TxPurpose::SafetyClearBook,
                         CU_CLEAR_BOOK,
                     );
                     state.clear_book_sends.fetch_add(1, Relaxed);
@@ -782,7 +848,12 @@ pub async fn run_engine(
                     next_sequence_number,
                 ) {
                     Ok(ixs) if !ixs.is_empty() => {
-                        tx_sender.fire(ixs, TxPriority::Normal, TxPurpose::Update, CU_FULL_UPDATE);
+                        let purpose = if force_recovery_update {
+                            TxPurpose::RecoveryUpdate
+                        } else {
+                            TxPurpose::Update
+                        };
+                        tx_sender.fire(ixs, TxPriority::Normal, purpose, CU_FULL_UPDATE);
                         local_seq = local_seq.saturating_add(sequence_count);
                         state.book_updates.fetch_add(1, Relaxed);
                         state.updates_sent.fetch_add(1, Relaxed);
@@ -793,6 +864,7 @@ pub async fn run_engine(
                         last_full_update_at = Some(Instant::now());
                         last_normal_update_at = Some(Instant::now());
                         force_next_full_update = false;
+                        force_recovery_update = false;
                         needs_initial_book = false;
                     }
                     Ok(_) => {}
@@ -930,7 +1002,7 @@ mod tests {
     #[test]
     fn partial_fill_accepts_reduced_depth_instead_of_refreshing() {
         assert_eq!(
-            missing_level_action(1, 1, 1, 2, true, false),
+            missing_level_action(1, 1, 1, 2, true, false, false),
             MissingLevelAction::AcceptReducedDepth
         );
         assert!(should_continue_after_missing_level_action(
@@ -944,17 +1016,25 @@ mod tests {
     }
 
     #[test]
-    fn empty_quote_side_accepts_reduced_depth_instead_of_refreshing() {
+    fn empty_quote_side_requests_recovery_refresh_instead_of_accepting_reduced_depth() {
         assert_eq!(
-            missing_level_action(1, 0, 1, 2, true, false),
-            MissingLevelAction::AcceptReducedDepth
+            missing_level_action(1, 0, 1, 2, true, false, false),
+            MissingLevelAction::RecoveryRefresh
+        );
+        assert!(!should_continue_after_missing_level_action(
+            MissingLevelAction::RecoveryRefresh,
+            false
+        ));
+        assert_eq!(
+            missing_level_action(1, 0, 1, 2, true, false, true),
+            MissingLevelAction::RecoveryThrottle
         );
     }
 
     #[test]
     fn fully_missing_book_requests_refresh_after_cooldown() {
         assert_eq!(
-            missing_level_action(0, 0, 1, 2, true, false),
+            missing_level_action(0, 0, 1, 2, true, false, false),
             MissingLevelAction::Refresh
         );
     }
@@ -962,11 +1042,11 @@ mod tests {
     #[test]
     fn fully_missing_book_respects_refresh_throttle() {
         assert_eq!(
-            missing_level_action(1, 0, 1, 2, true, true),
-            MissingLevelAction::AcceptReducedDepth
+            missing_level_action(1, 0, 1, 2, true, true, true),
+            MissingLevelAction::RecoveryThrottle
         );
         assert_eq!(
-            missing_level_action(0, 0, 1, 2, true, true),
+            missing_level_action(0, 0, 1, 2, true, true, false),
             MissingLevelAction::Throttle
         );
         assert!(!should_continue_after_missing_level_action(
@@ -981,9 +1061,16 @@ mod tests {
     }
 
     #[test]
+    fn full_update_throttle_allows_restoring_two_sided_book_after_soft_pause() {
+        assert!(!should_throttle_full_update(0, 1, 1, 1, false, true));
+        assert!(!should_throttle_full_update(1, 0, 1, 1, false, true));
+    }
+
+    #[test]
     fn full_update_throttle_blocks_same_or_larger_exposure() {
         assert!(should_throttle_full_update(1, 1, 1, 1, false, true));
         assert!(should_throttle_full_update(1, 1, 2, 1, false, true));
+        assert!(should_throttle_full_update(0, 1, 1, 0, false, true));
     }
 
     #[test]

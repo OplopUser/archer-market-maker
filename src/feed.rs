@@ -73,6 +73,62 @@ fn bounded_multiplier(value: Option<f64>, fallback: f64) -> f64 {
         .clamp(0.0, 1.0)
 }
 
+#[derive(Debug, PartialEq)]
+struct MarketIntelMultipliers {
+    size: f64,
+    bid_size: f64,
+    ask_size: f64,
+}
+
+fn capped_market_intel_multiplier(
+    signal: &Value,
+    recommendation_path: &str,
+    risk_cap_path: &str,
+    fallback: f64,
+) -> f64 {
+    let recommendation =
+        bounded_multiplier(json_finite_f64_at(signal, recommendation_path), fallback);
+    match json_finite_f64_at(signal, risk_cap_path) {
+        Some(cap) => recommendation.min(bounded_multiplier(Some(cap), 1.0)),
+        None => recommendation,
+    }
+}
+
+fn market_intel_multipliers(signal: &Value) -> MarketIntelMultipliers {
+    let size = capped_market_intel_multiplier(
+        signal,
+        "/recommendation/size_multiplier",
+        "/risk_budget/max_size_multiplier",
+        1.0,
+    );
+    let bid_size = if json_bool_at(signal, "/risk_budget/bid_enabled").unwrap_or(true) {
+        capped_market_intel_multiplier(
+            signal,
+            "/recommendation/bid_size_multiplier",
+            "/risk_budget/max_bid_size_multiplier",
+            1.0,
+        )
+    } else {
+        0.0
+    };
+    let ask_size = if json_bool_at(signal, "/risk_budget/ask_enabled").unwrap_or(true) {
+        capped_market_intel_multiplier(
+            signal,
+            "/recommendation/ask_size_multiplier",
+            "/risk_budget/max_ask_size_multiplier",
+            1.0,
+        )
+    } else {
+        0.0
+    };
+
+    MarketIntelMultipliers {
+        size,
+        bid_size,
+        ask_size,
+    }
+}
+
 fn market_intel_price(signal: &Value) -> Option<f64> {
     let signal = market_intel_signal_payload(signal);
     [
@@ -148,6 +204,7 @@ async fn run_market_intel_feed(
                         tracing::warn!(mode, quote_enabled, "market-intel signal is not quoteable");
                     }
                 } else if let Some(price) = market_intel_price(signal) {
+                    let multipliers = market_intel_multipliers(signal);
                     handle_tick(&state, &mut vol_tracker, price, price);
                     state.intel_spread_add_bps.store(
                         json_finite_f64_at(signal, "/recommendation/spread_add_bps")
@@ -155,27 +212,13 @@ async fn run_market_intel_feed(
                             .unwrap_or(0.0),
                         Relaxed,
                     );
-                    state.intel_size_multiplier.store(
-                        bounded_multiplier(
-                            json_finite_f64_at(signal, "/recommendation/size_multiplier"),
-                            1.0,
-                        ),
-                        Relaxed,
-                    );
-                    state.intel_bid_size_multiplier.store(
-                        bounded_multiplier(
-                            json_finite_f64_at(signal, "/recommendation/bid_size_multiplier"),
-                            1.0,
-                        ),
-                        Relaxed,
-                    );
-                    state.intel_ask_size_multiplier.store(
-                        bounded_multiplier(
-                            json_finite_f64_at(signal, "/recommendation/ask_size_multiplier"),
-                            1.0,
-                        ),
-                        Relaxed,
-                    );
+                    state.intel_size_multiplier.store(multipliers.size, Relaxed);
+                    state
+                        .intel_bid_size_multiplier
+                        .store(multipliers.bid_size, Relaxed);
+                    state
+                        .intel_ask_size_multiplier
+                        .store(multipliers.ask_size, Relaxed);
                     state.price_notify.notify_one();
                     failures = 0;
                     if !state.feed_alive.load(Relaxed) {
@@ -259,6 +302,60 @@ mod tests {
         });
 
         assert_eq!(market_intel_price(&scoped), Some(81.42));
+    }
+
+    #[test]
+    fn market_intel_multipliers_apply_risk_budget_caps() {
+        let signal = serde_json::json!({
+            "recommendation": {
+                "size_multiplier": "0.90",
+                "bid_size_multiplier": "0.70",
+                "ask_size_multiplier": "0.80"
+            },
+            "risk_budget": {
+                "bid_enabled": true,
+                "ask_enabled": true,
+                "max_size_multiplier": "0.15",
+                "max_bid_size_multiplier": "0.35",
+                "max_ask_size_multiplier": "1.0"
+            }
+        });
+
+        assert_eq!(
+            market_intel_multipliers(&signal),
+            MarketIntelMultipliers {
+                size: 0.15,
+                bid_size: 0.35,
+                ask_size: 0.80
+            }
+        );
+    }
+
+    #[test]
+    fn market_intel_multipliers_zero_risk_budget_disabled_side() {
+        let signal = serde_json::json!({
+            "recommendation": {
+                "size_multiplier": "1",
+                "bid_size_multiplier": "1",
+                "ask_size_multiplier": "1"
+            },
+            "risk_budget": {
+                "bid_enabled": false,
+                "ask_enabled": true,
+                "max_size_multiplier": "1",
+                "max_bid_size_multiplier": "1",
+                "max_ask_size_multiplier": "1"
+            }
+        });
+
+        assert_eq!(
+            market_intel_multipliers(&signal),
+            MarketIntelMultipliers {
+                size: 1.0,
+                bid_size: 0.0,
+                ask_size: 1.0
+            }
+        );
     }
 }
 

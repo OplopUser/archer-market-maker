@@ -70,10 +70,10 @@ max_intel_spread_tighten_bps = 0.0
 # If market-intel reduces only one side, add extra distance on that side.
 # Example: ask_size_multiplier=0.65 adds up to 14 bps when this cap is 40.
 max_intel_side_spread_add_bps = 40.0
-# Never quote the tightest level inside this per-side edge after all
-# volatility/intel adjustments. Wider configured levels preserve their spacing
-# above this floor.
-min_effective_spread_bps = 62.0
+# Optional per-side spread floor after volatility/intel adjustments. Keep the
+# default at zero so normal profiles use their configured levels; defensive
+# profiles should set an explicit wider floor when needed.
+min_effective_spread_bps = 0.0
 
 # Optional explicit edge budget. Archer widens the tightest level to at least
 # toxicity_buffer_bps + min_net_edge_bps, then uses this as the expected
@@ -87,10 +87,14 @@ min_intel_size_multiplier = 0.20
 # prevents taker clusters from repeatedly consuming the same side while the
 # market keeps moving through the quote.
 post_fill_cooldown_ms = 900000
-post_fill_side_size_multiplier = 0.0
+post_fill_side_size_multiplier = 0.35
 post_fill_markout_check_ms = 900000
 post_fill_adverse_markout_bps = 12.0
 post_fill_adverse_cooldown_ms = 3600000
+max_fee_guard_duration_minutes = 120.0
+min_fills_for_edge_evaluation = 3
+idle_exploration_after_secs = 3600
+forced_transition_trial_minutes = 30.0
 
 [risk]
 # Skip quote levels smaller than this quote notional. Prevents dust orders.
@@ -140,12 +144,17 @@ min_mid_update_ticks = 25
 # Replenish missing filled/cancelled levels at most this often. This must stay
 # slow enough that partial fills do not turn into a full-refresh fee loop.
 min_full_refresh_interval_ms = 600000
+min_empty_side_recovery_interval_ms = 60000
 
 # Hard guard against slow update churn that stays below the per-minute cap.
 max_tx_per_minute = 20
 max_update_tx_per_10min = 6
+max_recovery_update_tx_per_10min = 4
 max_clear_book_per_5min = 2
+max_safety_clear_book_per_5min = 4
 min_clear_book_interval_ms = 30000
+min_safety_clear_book_interval_ms = 10000
+staleness_clear_cooldown_secs = 300
 
 # Shadow mode: compute quotes but don't send transactions.
 shadow_mode = true

@@ -224,14 +224,22 @@ pub struct ExecutionSettings {
     pub min_mid_update_ticks: u64,
     #[serde(default = "default_min_full_refresh_interval_ms")]
     pub min_full_refresh_interval_ms: u64,
+    #[serde(default = "default_min_empty_side_recovery_interval_ms")]
+    pub min_empty_side_recovery_interval_ms: u64,
     #[serde(default = "default_max_tx_per_minute")]
     pub max_tx_per_minute: u64,
     #[serde(default = "default_max_update_tx_per_10min")]
     pub max_update_tx_per_10min: u64,
+    #[serde(default = "default_max_recovery_update_tx_per_10min")]
+    pub max_recovery_update_tx_per_10min: u64,
     #[serde(default = "default_max_clear_book_per_5min")]
     pub max_clear_book_per_5min: u64,
+    #[serde(default = "default_max_safety_clear_book_per_5min")]
+    pub max_safety_clear_book_per_5min: u64,
     #[serde(default = "default_min_clear_book_interval_ms")]
     pub min_clear_book_interval_ms: u64,
+    #[serde(default = "default_min_safety_clear_book_interval_ms")]
+    pub min_safety_clear_book_interval_ms: u64,
     #[serde(default = "default_maker_book_poll_interval_ms")]
     pub maker_book_poll_interval_ms: u64,
     #[serde(default)]
@@ -256,9 +264,14 @@ impl ExecutionSettings {
         TxBudgetConfig {
             max_tx_per_minute: self.max_tx_per_minute,
             max_update_tx_per_10min: self.max_update_tx_per_10min,
+            max_recovery_update_tx_per_10min: self.max_recovery_update_tx_per_10min,
             max_clear_book_per_5min: self.max_clear_book_per_5min,
+            max_safety_clear_book_per_5min: self.max_safety_clear_book_per_5min,
             min_clear_book_interval: std::time::Duration::from_millis(
                 self.min_clear_book_interval_ms,
+            ),
+            min_safety_clear_book_interval: std::time::Duration::from_millis(
+                self.min_safety_clear_book_interval_ms,
             ),
         }
     }
@@ -393,12 +406,24 @@ fn validate_config(c: &MMConfig) -> Result<()> {
         "max_update_tx_per_10min must be positive"
     );
     anyhow::ensure!(
+        c.execution.max_recovery_update_tx_per_10min > 0,
+        "max_recovery_update_tx_per_10min must be positive"
+    );
+    anyhow::ensure!(
         c.execution.min_full_refresh_interval_ms >= 1_000,
         "min_full_refresh_interval_ms must be at least 1000"
     );
     anyhow::ensure!(
+        c.execution.min_empty_side_recovery_interval_ms >= 1_000,
+        "min_empty_side_recovery_interval_ms must be at least 1000"
+    );
+    anyhow::ensure!(
         c.execution.max_clear_book_per_5min > 0,
         "max_clear_book_per_5min must be positive"
+    );
+    anyhow::ensure!(
+        c.execution.max_safety_clear_book_per_5min > 0,
+        "max_safety_clear_book_per_5min must be positive"
     );
     anyhow::ensure!(
         c.execution.maker_book_poll_interval_ms >= 1_000,
@@ -471,7 +496,7 @@ fn default_post_fill_cooldown_ms() -> u64 {
     900_000
 }
 fn default_post_fill_side_size_multiplier() -> f64 {
-    0.0
+    0.35
 }
 fn default_post_fill_markout_check_ms() -> u64 {
     900_000
@@ -527,17 +552,29 @@ fn default_min_mid_update_ticks() -> u64 {
 fn default_min_full_refresh_interval_ms() -> u64 {
     600_000
 }
+fn default_min_empty_side_recovery_interval_ms() -> u64 {
+    60_000
+}
 fn default_max_tx_per_minute() -> u64 {
     20
 }
 fn default_max_update_tx_per_10min() -> u64 {
     6
 }
+fn default_max_recovery_update_tx_per_10min() -> u64 {
+    4
+}
 fn default_max_clear_book_per_5min() -> u64 {
     2
 }
+fn default_max_safety_clear_book_per_5min() -> u64 {
+    4
+}
 fn default_min_clear_book_interval_ms() -> u64 {
     30_000
+}
+fn default_min_safety_clear_book_interval_ms() -> u64 {
+    10_000
 }
 fn default_maker_book_poll_interval_ms() -> u64 {
     2_000

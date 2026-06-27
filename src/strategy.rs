@@ -8,6 +8,7 @@ use crate::archer::{
 
 use crate::config::{RiskSettings, StrategySettings};
 
+#[derive(Debug)]
 pub enum QuoteDecision {
     ClearBook,
     UpdateMidOnly {
@@ -85,10 +86,7 @@ impl Strategy {
             (quoteable_base * mid_price * inventory_fraction).min(side_notional_cap);
 
         let intel_spread_add = self.intel_spread_add_bps(intel.spread_add_bps);
-        let size_multiplier = bounded_intel_size_multiplier(
-            intel.size_multiplier,
-            self.config.min_intel_size_multiplier,
-        );
+        let size_multiplier = bounded_intel_size_multiplier(intel.size_multiplier);
         let base_notional = available_base * mid_price;
         let quote_notional = available_quote;
         let raw_bid_size_multiplier = if should_suppress_inventory_adding_bids(
@@ -101,16 +99,10 @@ impl Strategy {
         } else {
             intel.bid_size_multiplier
         };
-        let bid_size_multiplier = size_multiplier
-            * bounded_intel_size_multiplier(
-                raw_bid_size_multiplier,
-                self.config.min_intel_size_multiplier,
-            );
-        let ask_size_multiplier = size_multiplier
-            * bounded_intel_size_multiplier(
-                intel.ask_size_multiplier,
-                self.config.min_intel_size_multiplier,
-            );
+        let bid_size_multiplier =
+            effective_intel_side_multiplier(size_multiplier, raw_bid_size_multiplier);
+        let ask_size_multiplier =
+            effective_intel_side_multiplier(size_multiplier, intel.ask_size_multiplier);
         let bid_side_spread_add = self.intel_side_spread_add_bps(bid_size_multiplier);
         let ask_side_spread_add = self.intel_side_spread_add_bps(ask_size_multiplier);
         let raw_tightest_bid_spread =
@@ -295,14 +287,20 @@ impl Strategy {
     }
 }
 
-fn bounded_intel_size_multiplier(value: f64, minimum: f64) -> f64 {
+fn bounded_intel_size_multiplier(value: f64) -> f64 {
     if !value.is_finite() {
         return 1.0;
     }
-    if value <= 0.0 {
+    if value <= 0.0 { 0.0 } else { value.min(1.0) }
+}
+
+fn effective_intel_side_multiplier(size_multiplier: f64, side_multiplier: f64) -> f64 {
+    let global = bounded_intel_size_multiplier(size_multiplier);
+    let side = bounded_intel_size_multiplier(side_multiplier);
+    if global <= 0.0 || side <= 0.0 {
         0.0
     } else {
-        value.max(minimum).min(1.0)
+        global.min(side)
     }
 }
 
@@ -366,7 +364,10 @@ fn levels_for_budget(
 }
 
 fn quantize(v: f64) -> f64 {
-    (v * 20.0).round() / 20.0
+    if !v.is_finite() || v <= 0.0 {
+        return 0.0;
+    }
+    ((v * 20.0).round() / 20.0).max(1.0 / 20.0)
 }
 
 fn structure_hash(
@@ -593,6 +594,46 @@ mod tests {
                 );
             }
             _ => panic!("expected full update"),
+        }
+    }
+
+    #[test]
+    fn recovery_probe_keeps_inventory_reducing_ask_with_bid_disabled() {
+        let risk = RiskSettings {
+            min_quote_notional: 1.0,
+            max_quote_notional_per_level: 12.0,
+            max_total_quote_notional: 60.0,
+            min_base_reserve_pct: 30.0,
+            min_quote_reserve_pct: 30.0,
+        };
+        let mut settings = strategy_settings();
+        settings.spread_levels_bps = vec![16.0, 30.0];
+        settings.inventory_pct = 20.0;
+        let config = market_config();
+        let strategy = Strategy::new(&settings, &risk);
+
+        let (decision, _) = strategy.compute(
+            73.93,
+            0,
+            0,
+            &config,
+            4_081,
+            536_297,
+            0.0,
+            IntelAdjustments {
+                spread_add_bps: 36.7,
+                size_multiplier: 0.35,
+                bid_size_multiplier: 0.0,
+                ask_size_multiplier: 0.35,
+            },
+        );
+
+        match decision {
+            QuoteDecision::UpdateFull { book_update, .. } => {
+                assert_eq!(book_update.bid_levels.len(), 0);
+                assert!(!book_update.ask_levels.is_empty());
+            }
+            other => panic!("expected ask-only full update, got {other:?}"),
         }
     }
 
@@ -850,7 +891,7 @@ mod tests {
     }
 
     #[test]
-    fn market_intel_scaled_budget_drops_sub_minimum_ask_level() {
+    fn market_intel_scaled_budget_uses_tightest_cap_without_double_reduction() {
         let risk = RiskSettings {
             min_quote_notional: 8.0,
             max_quote_notional_per_level: 18.0,
@@ -883,7 +924,7 @@ mod tests {
         match decision {
             QuoteDecision::UpdateFull { book_update, .. } => {
                 assert_eq!(book_update.bid_levels.len(), 2);
-                assert_eq!(book_update.ask_levels.len(), 1);
+                assert_eq!(book_update.ask_levels.len(), 2);
                 let ask_ticks = (book_update.new_mid_price_ticks as i64)
                     .saturating_add(book_update.ask_levels[0].price_offset_ticks)
                     .max(0) as u64;
@@ -893,6 +934,47 @@ mod tests {
                 assert!(ask_price * ask_size >= risk.min_quote_notional);
             }
             _ => panic!("expected full update"),
+        }
+    }
+
+    #[test]
+    fn shared_market_intel_cap_is_applied_once_per_side() {
+        let risk = RiskSettings {
+            min_quote_notional: 8.0,
+            max_quote_notional_per_level: 38.0,
+            max_total_quote_notional: 170.0,
+            min_base_reserve_pct: 20.0,
+            min_quote_reserve_pct: 20.0,
+        };
+        let mut settings = strategy_settings();
+        settings.spread_levels_bps = vec![24.0, 40.0];
+        settings.inventory_pct = 45.0;
+        settings.min_effective_spread_bps = 24.0;
+        let config = market_config();
+        let strategy = Strategy::new(&settings, &risk);
+
+        let (decision, _) = strategy.compute(
+            74.55,
+            0,
+            0,
+            &config,
+            4_908,
+            475_090,
+            0.0,
+            IntelAdjustments {
+                size_multiplier: 0.15,
+                bid_size_multiplier: 0.15,
+                ask_size_multiplier: 0.15,
+                spread_add_bps: 18.5,
+            },
+        );
+
+        match decision {
+            QuoteDecision::UpdateFull { book_update, .. } => {
+                assert_eq!(book_update.bid_levels.len(), 1);
+                assert_eq!(book_update.ask_levels.len(), 1);
+            }
+            _ => panic!("expected shared capped two-sided update"),
         }
     }
 

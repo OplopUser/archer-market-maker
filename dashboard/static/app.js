@@ -128,6 +128,9 @@ function renderHealth(data) {
   const txMixState = (kindCounts.clear || 0) > 1 ? "warn" : "ok";
   const liveState = live.state ? `${live.state} · ${live.action || "--"}` : "--";
   const liveRowState = live.alert?.severity === "critical" ? "bad" : live.alert?.severity === "warning" ? "warn" : "ok";
+  const lastFillSeconds = data.pnl?.seconds_since_last_fill;
+  const lastFillText = lastFillSeconds == null ? "--" : `${duration(lastFillSeconds)} ago`;
+  const lastFillState = data.pnl?.fills_this_window ? "ok" : lastFillSeconds > 3600 ? "warn" : "ok";
   const rows = [
     healthRow("Archer live status", liveState, liveRowState),
     healthRow("Controller", process.controller_running ? "running" : "down", process.controller_running ? "ok" : "bad"),
@@ -140,6 +143,7 @@ function renderHealth(data) {
     healthRow("On-chain failed tx", String(tx.failed_count || 0), tx.failed_count ? "warn" : "ok"),
     healthRow("Archer TX mix", txMix, txMixState),
     healthRow("Fill PnL signal", data.pnl?.fill_detected ? "inventory changed" : "no inventory change", data.pnl?.fill_detected ? "ok" : "warn"),
+    healthRow("Last fill", lastFillText, lastFillState),
   ];
   els.healthList.replaceChildren(...rows);
 }
@@ -148,6 +152,10 @@ function renderStrategy(data) {
   const s = data.strategy || {};
   const market = data.market || {};
   const intel = data.market_intel || {};
+  const approval = s.profile_approval || {};
+  const approvalText = approval.approved == null
+    ? "--"
+    : `${approval.approved ? "approved" : "blocked"} · ${approval.requested_profile || s.active_profile || "--"} -> ${approval.effective_profile || s.active_profile || "--"} · ${approval.source || "--"}`;
   const intelText = intel.enabled
     ? intel.ok
       ? `${intel.mode || "--"} · add ${fmtMaybeNum(intel.spread_add_bps, " bps")} · size ${fmtMaybeNum(intel.size_multiplier)} / ${fmtMaybeNum(intel.bid_size_multiplier)} / ${fmtMaybeNum(intel.ask_size_multiplier)}`
@@ -155,12 +163,14 @@ function renderStrategy(data) {
     : "disabled";
   els.strategyList.replaceChildren(
     row("Active profile", s.active_profile || "static"),
+    row("Profile approval", approvalText),
     row("Profile reason", s.active_reason || "--"),
     row("Spreads", `${(s.spreads_bps || []).join(" / ")} bps`),
     row("Market intel", intelText),
     row("Inventory pct", `${s.inventory_pct ?? "--"}%`),
     row("Heartbeat", `${s.heartbeat_ms ?? "--"} ms`),
     row("Mid update throttle", `${s.min_mid_update_interval_ms ?? "--"} ms / ${s.min_mid_update_ticks ?? "--"} ticks`),
+    row("Forced discovery trial", s.forced_transition_remaining_trial_minutes == null ? "--" : `${fmtNum.format(s.forced_transition_remaining_trial_minutes)}m left`),
     row("Priority fee", `${s.priority_fee_mode || "--"} cap ${s.priority_fee_cap ?? "--"} micro-lamports`),
     row("Maker fee", `${market.maker_fee_ppm ?? "--"} ppm`),
     row("Taker fee", `${market.taker_fee_ppm ?? "--"} ppm`),

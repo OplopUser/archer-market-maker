@@ -8,6 +8,28 @@ REASON="${ARCHER_INITIAL_REASON:-supervised gated validation run}"
 COMPOSE_FILE="${ARCHER_COMPOSE_FILE:-docker-compose.tuxedo.yml}"
 RUN_DIR="logs/adaptive-12h-${RUN_ID}"
 
+APPROVAL_RESULT="$(
+  ARCHER_REQUESTED_PROFILE="$PROFILE" ARCHER_REQUESTED_REASON="$REASON" python3 - <<'PY'
+import os
+import sys
+
+sys.path.insert(0, os.getcwd())
+from scripts.archer_adaptive_12h import resolve_profile_approval
+
+profile, reason = resolve_profile_approval(
+    os.environ["ARCHER_REQUESTED_PROFILE"],
+    os.environ["ARCHER_REQUESTED_REASON"],
+    source="supervised_validation:start",
+)
+print(profile)
+print(reason)
+PY
+)"
+PROFILE="$(printf '%s\n' "$APPROVAL_RESULT" | sed -n '1p')"
+REASON="$(printf '%s\n' "$APPROVAL_RESULT" | sed -n '2,$p')"
+export ARCHER_INITIAL_PROFILE="$PROFILE"
+export ARCHER_INITIAL_REASON="$REASON"
+
 read -r DEFAULT_PREFLIGHT_MIN_SPREAD DEFAULT_POST_GATE_SPREAD_FLOOR DEFAULT_POST_GATE_MIN_NET DEFAULT_POST_GATE_MAX_BREAK_EVEN DEFAULT_POST_GATE_MAX_TX_PER_HOUR < <(
   ARCHER_INITIAL_PROFILE="$PROFILE" python3 - <<'PY'
 import os
